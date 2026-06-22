@@ -1,0 +1,74 @@
+# =====================================================================
+# Wait-k fine-tuning config for sarvam-translate (Gemma3-based)
+# Override any field from the CLI, e.g.:
+#   python train.py --config configs/config.yaml waitk.k=5 training.lr=1e-4
+# =====================================================================
+
+seed: 42
+
+model:
+  name: sarvamai/sarvam-translate
+  dtype: bfloat16              # base weights loaded in this dtype
+  gradient_checkpointing: true
+  attn_implementation: eager   # gemma3 recommends eager unless flash-attn is installed
+
+lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:              # gemma3 attention + MLP projections
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  tsv_path: ../tel_Telu_samantar.tsv
+  # The tsv stores English in `src` and Telugu in `tgt`. For Telugu->English
+  # training we read Telugu as the source and English as the target.
+  source_column: tgt          # Telugu column -> model input
+  target_column: src          # English column -> model output
+  target_language: English    # used in the prompt: "Translate the text below to {target_language}."
+  val_fraction: 0.02
+  max_length: 512
+  num_workers: 4
+
+waitk:
+  k: 3                         # wait-k lag (in source words)
+  # Probability of emitting a full sentence pair (vs a sampled wait-k prefix
+  # pair). Mixing keeps the model's full-sentence ability while teaching it
+  # to translate partial input.
+  full_sentence_prob: 0.3
+
+training:
+  lr: 1.0e-4
+  weight_decay: 0.0
+  batch_size: 4             # per-device
+  grad_accum: 2
+  max_epochs: 3
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  precision: bf16-true        # bf16-true pairs with bf16 base weights + LoRA
+
+trainer:
+  devices: 4                  # number of GPUs; set to 1 for single-GPU
+  strategy: ddp_find_unused_parameters_true   # LoRA freezes base -> unused params
+  accelerator: gpu
+  log_every_n_steps: 20
+  val_check_interval: 0.5     # validate twice per epoch
+
+checkpoint:
+  dirpath: checkpoints_samanathar
+  save_top_k: 2
+  monitor: val/loss
+  mode: min
+
+wandb:
+  enabled: true
+  project: simul-mt-waitk
+  name: null                  # null -> auto-generated run name
+  entity: null

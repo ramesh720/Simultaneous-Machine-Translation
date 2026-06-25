@@ -1,7 +1,7 @@
 // =============================================================================
 // Simultaneous MT — Frontend Application
-// Handles language selection, streaming translation, trace visualization,
-// policy comparison, and metrics charts.
+// Live (as-you-type) wait-k translation, READ/WRITE trace visualization, and
+// an on-demand full-sentence quality comparison.
 // =============================================================================
 
 // --- State ---
@@ -11,7 +11,9 @@ let state = {
     k: 3,
     languages: [],
     examples: {},
-    isTranslating: false,
+    // Latest live translation (used by the quality check)
+    lastText: null,
+    lastWaitk: null,
 };
 
 // --- Initialization ---
@@ -20,7 +22,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadExamples();
     setupKSlider();
     setupSwapButton();
-    loadMetrics();
+    setupLiveInput();
 });
 
 // --- Language Setup ---
@@ -75,6 +77,7 @@ function selectSrcLang(code) {
     }
     state.srcLang = code;
     renderLanguageSelectors();
+    restart();
 }
 
 function selectTgtLang(code) {
@@ -83,6 +86,7 @@ function selectTgtLang(code) {
     }
     state.tgtLang = code;
     renderLanguageSelectors();
+    restart();
 }
 
 function updateLabels() {
@@ -98,6 +102,7 @@ function setupSwapButton() {
         state.srcLang = state.tgtLang;
         state.tgtLang = tmp;
         renderLanguageSelectors();
+        restart();
     });
 }
 
@@ -130,19 +135,24 @@ function renderExamples() {
         chip.className = 'example-chip';
         chip.textContent = text;
         chip.onclick = () => {
-            document.getElementById('source-input').value = text;
+            // Trailing space so every word is "settled" and translates immediately.
+            document.getElementById('source-input').value = text + ' ';
+            restart();
         };
         bar.appendChild(chip);
     });
 }
 
-// --- K Slider ---
+// --- K Slider (applied to the live translation in real time) ---
 function setupKSlider() {
     const slider = document.getElementById('k-slider');
     const display = document.getElementById('k-display');
     slider.addEventListener('input', () => {
         state.k = parseInt(slider.value);
         display.textContent = `k=${state.k}`;
+        // Debounce: dragging fires many events; re-translate once it settles.
+        clearTimeout(wk.typingTimer);
+        wk.typingTimer = setTimeout(restart, 600);
     });
 }
 
@@ -162,124 +172,183 @@ function activatePipelineStep(stepId) {
     }
 }
 
-// --- Translation: Full Sentence ---
-async function translateFull() {
-    const text = document.getElementById('source-input').value.trim();
-    if (!text || state.isTranslating) return;
+// =============================================================================
+// Incremental wait-k translation.
+// On each completed word the client posts /api/translate/step, which advances
+// the translation by ~one forward pass (re-using the tokens committed so far).
+// After 2s of paused typing we "finalize" (read the rest + flush to EOS) and
+// reveal the full-sentence quality button.
+// =============================================================================
+const FINALIZE_MS = 2000;
 
-    state.isTranslating = true;
-    setStatus('Translating (full sentence)...', 'active');
-    activatePipelineStep('pipe-source');
+// Decode state, kept in sync with the server step by step.
+let wk = {
+    committed: [],   // target token ids emitted so far
+    read: 0,         // source words already read by the model
+    words: [],       // the source words already read (for edit detection)
+    running: false,  // a /step request is in flight (serializes steps)
+    typingTimer: null,
+};
 
-    const outputEl = document.getElementById('translation-output');
-    outputEl.innerHTML = '<span class="loading-shimmer" style="display:inline-block;width:60%;height:1.2em;border-radius:4px;">&nbsp;</span>';
-
-    try {
-        const res = await fetch('/api/translate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, target_lang: state.tgtLang }),
-        });
-        const data = await res.json();
-        outputEl.textContent = data.translation;
-        activatePipelineStep('pipe-target');
-        setStatus(`Done — Full sentence translation`, 'active');
-    } catch (e) {
-        outputEl.textContent = `Error: ${e.message}`;
-        setStatus('Error', '');
-    }
-
-    state.isTranslating = false;
+function setupLiveInput() {
+    document.getElementById('source-input').addEventListener('input', onSourceInput);
 }
 
-// --- Translation: Streaming Wait-K ---
-let _eventSource = null;
+// Completed words: trailing word is excluded until a space follows it, so we
+// translate once per finished word.
+function settledWords() {
+    const v = document.getElementById('source-input').value;
+    const parts = v.split(/\s+/).filter(Boolean);
+    if (!/\s$/.test(v)) parts.pop();
+    return parts;
+}
+function allWords() {
+    return document.getElementById('source-input').value.split(/\s+/).filter(Boolean);
+}
 
-function translateStream() {
-    const text = document.getElementById('source-input').value.trim();
-    if (!text || state.isTranslating) return;
+function onSourceInput() {
+    clearTimeout(wk.typingTimer);
+    hideQualityButton();
+    if (!document.getElementById('source-input').value.trim()) {
+        resetWk();
+        setStatus('Ready', '');
+        return;
+    }
+    pump();                                              // translate completed words
+    wk.typingTimer = setTimeout(finalize, FINALIZE_MS);  // flush + button on pause
+}
 
-    // Close any previous stream
-    if (_eventSource) { _eventSource.close(); _eventSource = null; }
+function resetWk() {
+    wk.committed = []; wk.read = 0; wk.words = [];
+    document.getElementById('translation-output').innerHTML =
+        '<span class="placeholder-text" style="color: var(--text-muted)">Translation will appear here as you type...</span>';
+    document.getElementById('trace-container').innerHTML =
+        '<div style="color: var(--text-muted); font-style: italic;">READ / WRITE steps will appear here as you type…</div>';
+    document.getElementById('trace-stats').textContent = '';
+    activatePipelineStep(null);
+}
 
-    state.isTranslating = true;
-    setStatus(`Translating (wait-${state.k})...`, 'streaming');
+// Restart the translation for the current text (after k / language change).
+function restart() {
+    clearTimeout(wk.typingTimer);
+    resetWk();
+    hideQualityButton();
+    if (document.getElementById('source-input').value.trim()) {
+        pump();
+        wk.typingTimer = setTimeout(finalize, FINALIZE_MS);
+    } else {
+        setStatus('Ready', '');
+    }
+}
 
+// Does `words` extend the words already read (normal typing) vs an edit?
+function extendsRead(words) {
+    if (words.length < wk.read) return false;
+    for (let i = 0; i < wk.read; i++) if (words[i] !== wk.words[i]) return false;
+    return true;
+}
+
+// Translate any settled words not yet read. Serialized via wk.running.
+async function pump() {
+    if (wk.running) return;
+    wk.running = true;
+    try {
+        while (true) {
+            const words = settledWords();
+            if (!extendsRead(words)) { resetWk(); continue; }  // edited → restart
+            if (words.length <= wk.read) break;                 // nothing new
+            await doStep(words, false);
+        }
+    } catch (_) {
+        // doStep already reported the error to the status bar.
+    } finally {
+        wk.running = false;
+    }
+}
+
+// On a typing pause: read remaining words (incl. the in-progress one), flush the
+// tail to EOS, then reveal the quality button.
+async function finalize() {
+    if (wk.running) { wk.typingTimer = setTimeout(finalize, 300); return; }
+    const words = allWords();
+    if (words.length === 0) return;
+    wk.running = true;
+    try {
+        if (!extendsRead(words)) resetWk();
+        await doStep(words, true);
+        if (wk.committed.length) {
+            setStatus(`Done — wait-${state.k} complete (${words.length} words → ${wk.committed.length} tokens)`, 'active');
+            activatePipelineStep('pipe-target');
+            showQualityButton();
+        }
+    } catch (_) {
+        // reported in doStep
+    } finally {
+        wk.running = false;
+    }
+}
+
+// One server step: read new words, render new READ/WRITE events.
+async function doStep(words, finalizeFlag) {
     const outputEl = document.getElementById('translation-output');
     const traceEl = document.getElementById('trace-container');
     const statsEl = document.getElementById('trace-stats');
 
-    outputEl.innerHTML = '<span class="cursor-blink"></span>';
-    traceEl.innerHTML = '';
-    statsEl.textContent = '';
+    setStatus(finalizeFlag ? `Finishing (wait-${state.k})…` : `Translating (wait-${state.k})…`, 'streaming');
 
-    let readCount = 0, writeCount = 0;
-
-    const params = new URLSearchParams({ text, target_lang: state.tgtLang, k: state.k });
-    _eventSource = new EventSource(`/api/translate/stream?${params}`);
-
-    _eventSource.addEventListener('read', (e) => {
-        const data = JSON.parse(e.data);
-        handleStreamEvent('read', data, outputEl, traceEl, statsEl);
-        readCount++;
-        statsEl.textContent = `READ: ${readCount} | WRITE: ${writeCount}`;
-    });
-
-    _eventSource.addEventListener('write', (e) => {
-        const data = JSON.parse(e.data);
-        handleStreamEvent('write', data, outputEl, traceEl, statsEl);
-        writeCount++;
-        statsEl.textContent = `READ: ${readCount} | WRITE: ${writeCount}`;
-    });
-
-    _eventSource.addEventListener('stop', (e) => {
-        handleStreamEvent('stop', {}, outputEl, traceEl, statsEl);
-    });
-
-    _eventSource.addEventListener('done', (e) => {
-        const data = JSON.parse(e.data);
-        handleStreamEvent('done', data, outputEl, traceEl, statsEl);
-        _eventSource.close(); _eventSource = null;
-        state.isTranslating = false;
-    });
-
-    _eventSource.onerror = () => {
-        outputEl.textContent = 'Error: could not stream translation. Check server logs.';
-        setStatus('Error', '');
-        _eventSource.close(); _eventSource = null;
-        state.isTranslating = false;
-    };
-}
-
-function handleStreamEvent(event, data, outputEl, traceEl, statsEl) {
-    switch (event) {
-        case 'read':
-            activatePipelineStep('pipe-read');
-            addTraceStep(traceEl, 'read', `"${data.word}" (${data.src_read}/${data.src_total})`);
-            break;
-
-        case 'write':
-            activatePipelineStep('pipe-write');
-            outputEl.innerHTML = escapeHtml(data.translation_so_far) +
-                '<span class="cursor-blink"></span>';
-            addTraceStep(traceEl, 'write', `"${data.token}" → ${data.translation_so_far}`);
-            break;
-
-        case 'stop':
-            activatePipelineStep('pipe-target');
-            addTraceStep(traceEl, 'stop', 'End of translation');
-            // Remove cursor
-            const cursor = outputEl.querySelector('.cursor-blink');
-            if (cursor) cursor.remove();
-            setStatus(`Done — Wait-${state.k} translation complete`, 'active');
-            break;
-
-        case 'done':
-            activatePipelineStep('pipe-target');
-            outputEl.textContent = data.translation;
-            setStatus(`Done — Wait-${state.k} | ${data.src_words} src words → ${data.tgt_tokens} tokens`, 'active');
-            break;
+    let res;
+    try {
+        res = await fetch('/api/translate/step', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                words, committed: wk.committed, read: wk.read,
+                k: state.k, target_lang: state.tgtLang, finalize: finalizeFlag,
+            }),
+        });
+    } catch (e) {
+        setStatus('Error: could not reach the server. Is server.py running (and restarted)?', '');
+        throw e;
     }
+    if (!res.ok) {
+        setStatus(`Error: server returned ${res.status}. Restart server.py after code changes.`, '');
+        throw new Error(`HTTP ${res.status}`);
+    }
+    const d = await res.json();
+    if (d.error) { setStatus(`Error: ${d.error}`, ''); throw new Error(d.error); }
+
+    // Drop the trace placeholder once real steps arrive.
+    if (!traceEl.querySelector('.trace-step') && (d.reads.length || d.writes.length)) {
+        traceEl.innerHTML = '';
+    }
+
+    let r = wk.read;
+    d.reads.forEach(word => {
+        r++;
+        activatePipelineStep('pipe-read');
+        addTraceStep(traceEl, 'read', `"${word}" (${r}/${d.src_total})`);
+    });
+    d.writes.forEach(w => {
+        activatePipelineStep('pipe-write');
+        addTraceStep(traceEl, 'write', `"${w.token}" → ${w.translation_so_far}`);
+    });
+
+    wk.committed = d.committed;
+    wk.read = d.read;
+    wk.words = words.slice(0, d.read);
+
+    if (d.translation_so_far) outputEl.textContent = d.translation_so_far;
+    statsEl.textContent = `READ: ${wk.read} | WRITE: ${wk.committed.length}`;
+
+    if (!finalizeFlag) {
+        setStatus(d.writes.length
+            ? `Translating (wait-${state.k}) — ${wk.read} words read`
+            : `Reading… (wait-${state.k} lag)`, d.writes.length ? 'streaming' : 'active');
+    }
+
+    // Keep latest output available for the quality check.
+    state.lastText = document.getElementById('source-input').value.trim();
+    state.lastWaitk = d.translation_so_far;
 }
 
 function addTraceStep(container, action, detail) {
@@ -293,230 +362,105 @@ function addTraceStep(container, action, detail) {
     container.scrollTop = container.scrollHeight;
 }
 
-// --- Comparison ---
-async function runComparison() {
-    const text = document.getElementById('source-input').value.trim();
-    if (!text || state.isTranslating) return;
+// --- Quality button visibility ---
+function showQualityButton() {
+    document.getElementById('quality-action').style.display = '';
+}
+function hideQualityButton() {
+    document.getElementById('quality-action').style.display = 'none';
+}
 
-    state.isTranslating = true;
-    const fullEl = document.getElementById('comparison-full');
-    const waitkEl = document.getElementById('comparison-waitk');
-    const fullStatus = document.getElementById('comparison-full-status');
-    const waitkStatus = document.getElementById('comparison-waitk-status');
+// =============================================================================
+// Full-sentence check: offline translation + COMET / AL / LAAL for the wait-k run
+// =============================================================================
+async function checkQuality() {
+    if (!state.lastText || !state.lastWaitk) return;
 
-    fullEl.innerHTML = '<span class="loading-shimmer" style="display:inline-block;width:80%;height:1.2em;border-radius:4px;">&nbsp;</span>';
-    waitkEl.innerHTML = '<span class="loading-shimmer" style="display:inline-block;width:80%;height:1.2em;border-radius:4px;">&nbsp;</span>';
-    fullStatus.innerHTML = '<span class="status-dot"></span><span>Running both policies...</span>';
-    fullStatus.className = 'status-bar streaming';
-    waitkStatus.innerHTML = '<span class="status-dot"></span><span>Running both policies...</span>';
-    waitkStatus.className = 'status-bar streaming';
+    const btn = document.getElementById('btn-check-quality');
+    const results = document.getElementById('quality-results');
+    btn.disabled = true;
+    btn.textContent = '⏳ Translating full sentence + scoring…';
+    results.innerHTML = '<div class="card"><span class="loading-shimmer" style="display:inline-block;width:70%;height:1.2em;border-radius:4px;">&nbsp;</span>'
+        + '<p class="section-subtitle" style="margin-top:12px">Running the offline translation and COMET (COMET runs on CPU — first use also downloads the model, so this can take a while).</p></div>';
 
     try {
-        const res = await fetch('/api/translate/compare', {
+        const res = await fetch('/api/translate/quality', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, target_lang: state.tgtLang, k: state.k }),
+            body: JSON.stringify({
+                text: state.lastText,
+                target_lang: state.tgtLang,
+                waitk_translation: state.lastWaitk,
+                tgt_tokens: wk.committed.length,
+                k: state.k,
+            }),
         });
+        if (!res.ok) throw new Error(`server returned ${res.status}`);
         const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        renderQualityResults(data);
+        results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+        results.innerHTML = `<div class="card"><span style="color:#f43f5e">Error: ${escapeHtml(e.message)}</span></div>`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '📊 Check full sentence';
+    }
+}
 
-        // Full-sentence result
-        fullEl.textContent = data.full_translation;
-        fullStatus.innerHTML = '<span class="status-dot"></span><span>Complete (reads all → translates)</span>';
-        fullStatus.className = 'status-bar active';
-
-        // Wait-K result with metrics
-        const m = data.metrics;
-        waitkEl.innerHTML = `
-            <div style="margin-bottom:12px">${escapeHtml(data.waitk_translation)}</div>
-            <div style="padding:12px; background:rgba(0,0,0,0.25); border-radius:8px; border:1px solid var(--border-glass)">
-                <div style="font-size:0.75rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px">Latency Metrics</div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:0.9rem">
-                    <div>Average Lagging (AL):<br><strong style="color:var(--accent-primary); font-size:1.1rem">${m.al !== null ? m.al + ' words' : 'N/A'}</strong></div>
-                    <div>Length-Adaptive AL:<br><strong style="color:var(--accent-primary); font-size:1.1rem">${m.laal !== null ? m.laal + ' words' : 'N/A'}</strong></div>
-                </div>
+function renderQualityResults(data) {
+    const fmt = v => (v === null || v === undefined) ? 'N/A' : v;
+    const cometCard = (data.comet !== null && data.comet !== undefined)
+        ? `<div class="metric-value">${data.comet}</div>
+           <div class="metric-label">COMET (Wait-K vs offline)</div>`
+        : `<div class="metric-value" style="font-size:0.95rem">N/A</div>
+           <div class="metric-label">${escapeHtml(data.comet_error || 'COMET unavailable')}</div>`;
+    const results = document.getElementById('quality-results');
+    results.innerHTML = `
+        <div class="metrics-grid" style="margin-bottom:24px">
+            <div class="metric-card">${cometCard}</div>
+            <div class="metric-card">
+                <div class="metric-value">${fmt(data.al)}</div>
+                <div class="metric-label">Average Lagging (AL)</div>
             </div>
-        `;
-        waitkStatus.innerHTML = `<span class="status-dot"></span><span>Complete (Wait-${m.k}, ${m.src_words} source words)</span>`;
-        waitkStatus.className = 'status-bar active';
-    } catch (e) {
-        fullEl.textContent = `Error: ${e.message}`;
-        waitkEl.textContent = `Error: ${e.message}`;
-        fullStatus.className = waitkStatus.className = 'status-bar';
-    }
-
-    state.isTranslating = false;
-}
-
-// --- Clear ---
-function clearAll() {
-    document.getElementById('source-input').value = '';
-    document.getElementById('translation-output').innerHTML =
-        '<span style="color: var(--text-muted)">Translation will appear here...</span>';
-    document.getElementById('trace-container').innerHTML =
-        '<div style="color: var(--text-muted); font-style: italic;">Trace will appear here when you run a Wait-K translation...</div>';
-    document.getElementById('trace-stats').textContent = '';
-    setStatus('Ready', '');
-    activatePipelineStep(null);
-}
-
-// --- Metrics Dashboard ---
-async function loadMetrics() {
-    try {
-        const res = await fetch('/api/metrics');
-        const data = await res.json();
-        if (data.results && data.results.length > 0) {
-            renderMetricsSummary(data.results);
-            renderBLEUvsALChart(data.results);
-            renderBLEUbyLangChart(data.results);
-        } else {
-            document.getElementById('metrics-summary').innerHTML =
-                '<div class="metric-card" style="grid-column: 1/-1;"><p style="color:var(--text-muted)">No evaluation results yet. Run the evaluation pipeline first.</p></div>';
-        }
-    } catch (e) {
-        console.warn('Could not load metrics:', e);
-    }
-}
-
-function renderMetricsSummary(results) {
-    const container = document.getElementById('metrics-summary');
-    const fullResults = results.filter(r => r.policy === 'full');
-    const waitkResults = results.filter(r => r.policy !== 'full');
-
-    const avgBleu = results.reduce((s, r) => s + (r.bleu || 0), 0) / results.length;
-    const avgAL = waitkResults.filter(r => r.AL).reduce((s, r) => s + r.AL, 0) / (waitkResults.filter(r => r.AL).length || 1);
-    const avgComet = results.filter(r => r.comet).reduce((s, r) => s + r.comet, 0) / (results.filter(r => r.comet).length || 1);
-    const avgLAAL = waitkResults.filter(r => r.LAAL).reduce((s, r) => s + r.LAAL, 0) / (waitkResults.filter(r => r.LAAL).length || 1);
-
-    container.innerHTML = `
-        <div class="metric-card">
-            <div class="metric-value">${avgBleu.toFixed(1)}</div>
-            <div class="metric-label">Avg BLEU</div>
+            <div class="metric-card">
+                <div class="metric-value">${fmt(data.laal)}</div>
+                <div class="metric-label">Length-Adaptive AL</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">wait-${fmt(data.k)}</div>
+                <div class="metric-label">Policy</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">${fmt(data.src_words)}</div>
+                <div class="metric-label">Source words</div>
+            </div>
         </div>
-        <div class="metric-card">
-            <div class="metric-value">${avgComet > 0 ? avgComet.toFixed(3) : 'N/A'}</div>
-            <div class="metric-label">Avg COMET</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">${avgAL > 0 ? avgAL.toFixed(1) : 'N/A'}</div>
-            <div class="metric-label">Avg AL</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">${avgLAAL > 0 ? avgLAAL.toFixed(1) : 'N/A'}</div>
-            <div class="metric-label">Avg LAAL</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">${results.length}</div>
-            <div class="metric-label">Evaluations</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">${new Set(results.map(r => r.lang)).size}</div>
-            <div class="metric-label">Languages</div>
+        <div class="comparison-grid">
+            <div class="card comparison-card simultaneous">
+                <span class="card-badge">Simultaneous</span>
+                <h3 style="margin:8px 0">Wait-K (live)</h3>
+                <div class="output-box">${escapeHtml(state.lastWaitk)}</div>
+            </div>
+            <div class="card comparison-card offline">
+                <span class="card-badge">Offline</span>
+                <h3 style="margin:8px 0">Full sentence (reference)</h3>
+                <div class="output-box">${escapeHtml(data.full_translation)}</div>
+            </div>
         </div>
     `;
 }
 
-function renderBLEUvsALChart(results) {
-    const canvas = document.getElementById('bleu-al-chart');
-    const waitkResults = results.filter(r => r.AL != null && r.bleu != null);
-
-    // Group by language
-    const langs = [...new Set(waitkResults.map(r => r.lang))];
-    const colors = { te: '#6366f1', hi: '#22c55e', gu: '#f59e0b', ta: '#f43f5e' };
-    const langNames = { te: 'Telugu', hi: 'Hindi', gu: 'Gujarati', ta: 'Tamil' };
-
-    const datasets = langs.map(lang => {
-        const langData = waitkResults
-            .filter(r => r.lang === lang)
-            .sort((a, b) => a.AL - b.AL);
-        return {
-            label: langNames[lang] || lang,
-            data: langData.map(r => ({ x: r.AL, y: r.bleu })),
-            borderColor: colors[lang] || '#888',
-            backgroundColor: (colors[lang] || '#888') + '33',
-            pointRadius: 5,
-            pointHoverRadius: 8,
-            showLine: true,
-            tension: 0.3,
-        };
-    });
-
-    new Chart(canvas, {
-        type: 'scatter',
-        data: { datasets },
-        options: {
-            responsive: true,
-            plugins: {
-                legend: { labels: { color: '#94a3b8' } },
-                tooltip: {
-                    callbacks: {
-                        label: ctx => `${ctx.dataset.label}: BLEU=${ctx.parsed.y.toFixed(1)}, AL=${ctx.parsed.x.toFixed(1)}`
-                    }
-                }
-            },
-            scales: {
-                x: {
-                    title: { display: true, text: 'Average Lagging (AL)', color: '#94a3b8' },
-                    ticks: { color: '#64748b' },
-                    grid: { color: 'rgba(255,255,255,0.05)' },
-                },
-                y: {
-                    title: { display: true, text: 'BLEU', color: '#94a3b8' },
-                    ticks: { color: '#64748b' },
-                    grid: { color: 'rgba(255,255,255,0.05)' },
-                },
-            },
-        },
-    });
-}
-
-function renderBLEUbyLangChart(results) {
-    const canvas = document.getElementById('bleu-lang-chart');
-    const policies = [...new Set(results.map(r => r.policy))].sort();
-    const langs = [...new Set(results.map(r => r.lang))];
-    const langNames = { te: 'Telugu', hi: 'Hindi', gu: 'Gujarati', ta: 'Tamil' };
-    const policyColors = {
-        'full': '#6366f1',
-        'wait-1': '#f43f5e',
-        'wait-3': '#f59e0b',
-        'wait-5': '#22c55e',
-        'wait-7': '#3b82f6',
-    };
-
-    const datasets = policies.map(policy => ({
-        label: policy,
-        data: langs.map(lang => {
-            const r = results.find(r => r.policy === policy && r.lang === lang);
-            return r ? r.bleu : 0;
-        }),
-        backgroundColor: (policyColors[policy] || '#888') + '99',
-        borderColor: policyColors[policy] || '#888',
-        borderWidth: 1,
-    }));
-
-    new Chart(canvas, {
-        type: 'bar',
-        data: {
-            labels: langs.map(l => langNames[l] || l),
-            datasets,
-        },
-        options: {
-            responsive: true,
-            plugins: {
-                legend: { labels: { color: '#94a3b8' } },
-            },
-            scales: {
-                x: {
-                    ticks: { color: '#64748b' },
-                    grid: { color: 'rgba(255,255,255,0.05)' },
-                },
-                y: {
-                    title: { display: true, text: 'BLEU', color: '#94a3b8' },
-                    ticks: { color: '#64748b' },
-                    grid: { color: 'rgba(255,255,255,0.05)' },
-                },
-            },
-        },
-    });
+// --- Clear ---
+function clearAll() {
+    clearTimeout(wk.typingTimer);
+    document.getElementById('source-input').value = '';
+    resetWk();
+    hideQualityButton();
+    state.lastText = state.lastWaitk = null;
+    document.getElementById('quality-results').innerHTML =
+        '<div class="card"><span class="placeholder-text" style="color: var(--text-muted)">Type a sentence above, then click “Check full sentence” to compare the live Wait-K output against the offline translation (COMET, AL, LAAL).</span></div>';
+    setStatus('Ready', '');
 }
 
 // --- Utilities ---

@@ -6,7 +6,6 @@
     <title>SimulMT — Simultaneous Machine Translation</title>
     <meta name="description" content="Interactive demonstration of Simultaneous Machine Translation using Wait-K policy with SimulMask attention masking for Telugu, Hindi, Gujarati, and Tamil.">
     <link rel="stylesheet" href="/static/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
 <body>
 
@@ -89,7 +88,7 @@
 <section id="demo-section">
     <div class="container">
         <h2 class="section-title">Live Translation Demo</h2>
-        <p class="section-subtitle">Watch simultaneous translation happen word-by-word in real time</p>
+        <p class="section-subtitle">Just start typing — translation appears live under the Wait-K policy, revising itself as you go</p>
 
         <div class="card">
             <!-- Language Selection -->
@@ -111,31 +110,25 @@
             <!-- Example Sentences -->
             <div class="examples-bar" id="examples-bar"></div>
 
+            <!-- Action Buttons -->
+            <div class="btn-group">
+                <button class="btn btn-secondary" id="btn-clear" onclick="clearAll()">
+                    ✕ Clear
+                </button>
+            </div>
+
             <!-- Input/Output -->
             <div class="translation-grid">
                 <div class="input-area">
                     <span class="area-label" id="input-label">Source (Telugu)</span>
-                    <textarea id="source-input" placeholder="Type or paste text here..."></textarea>
+                    <textarea id="source-input" placeholder="Start typing here — translation is live..."></textarea>
                 </div>
                 <div class="output-area">
                     <span class="area-label" id="output-label">Translation (English)</span>
                     <div class="output-box" id="translation-output">
-                        <span class="placeholder-text" style="color: var(--text-muted)">Translation will appear here...</span>
+                        <span class="placeholder-text" style="color: var(--text-muted)">Translation will appear here as you type...</span>
                     </div>
                 </div>
-            </div>
-
-            <!-- Action Buttons -->
-            <div class="btn-group">
-                <button class="btn btn-primary" id="btn-translate-stream" onclick="translateStream()">
-                    ⚡ Simultaneous (Wait-K)
-                </button>
-                <button class="btn btn-secondary" id="btn-translate-full" onclick="translateFull()">
-                    📄 Full Sentence
-                </button>
-                <button class="btn btn-secondary" id="btn-clear" onclick="clearAll()">
-                    ✕ Clear
-                </button>
             </div>
 
             <!-- Status -->
@@ -152,76 +145,34 @@
                 </div>
                 <div class="trace-container" id="trace-container">
                     <div style="color: var(--text-muted); font-style: italic;">
-                        Trace will appear here when you run a Wait-K translation...
+                        READ / WRITE steps will appear here as you type…
                     </div>
                 </div>
             </div>
+
+            <!-- Full-sentence check (appears 2s after typing pauses) -->
+            <div class="btn-group" id="quality-action" style="display: none; margin-top: 16px;">
+                <button class="btn btn-primary" id="btn-check-quality" onclick="checkQuality()">
+                    📊 Check full sentence
+                </button>
+            </div>
         </div>
     </div>
 </section>
 
-<!-- ===== COMPARISON ===== -->
-<section id="comparison-section">
-    <div class="container">
-        <h2 class="section-title">Policy Comparison</h2>
-        <p class="section-subtitle">Full-sentence (offline) vs Wait-K (simultaneous) — quality vs latency</p>
-
-        <div class="comparison-grid">
-            <div class="card comparison-card offline">
-                <span class="card-badge">Offline</span>
-                <h3 style="margin-top: 8px; margin-bottom: 8px;">Full Sentence</h3>
-                <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
-                    Reads entire source → produces complete translation. Maximum quality, maximum latency.
-                </p>
-                <div class="output-box" id="comparison-full" style="min-height: 100px;">
-                    <span style="color: var(--text-muted)">Run comparison to see results...</span>
-                </div>
-                <div class="status-bar" id="comparison-full-status" style="margin-top: 8px;">
-                    <span class="status-dot"></span>
-                    <span>Waiting</span>
-                </div>
-            </div>
-
-            <div class="card comparison-card simultaneous">
-                <span class="card-badge">Simultaneous</span>
-                <h3 style="margin-top: 8px; margin-bottom: 8px;">Wait-K</h3>
-                <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
-                    Starts translating after reading K words. Lower latency, near-offline quality.
-                </p>
-                <div class="output-box" id="comparison-waitk" style="min-height: 100px;">
-                    <span style="color: var(--text-muted)">Run comparison to see results...</span>
-                </div>
-                <div class="status-bar" id="comparison-waitk-status" style="margin-top: 8px;">
-                    <span class="status-dot"></span>
-                    <span>Waiting</span>
-                </div>
-            </div>
-        </div>
-
-        <div style="text-align: center; margin-top: 24px;">
-            <button class="btn btn-primary" id="btn-compare" onclick="runComparison()">
-                🔄 Run Comparison
-            </button>
-        </div>
-    </div>
-</section>
-
-<!-- ===== METRICS DASHBOARD ===== -->
+<!-- ===== METRICS (LIVE, PER-SESSION) ===== -->
 <section id="metrics-section">
     <div class="container">
         <h2 class="section-title">Evaluation Metrics</h2>
-        <p class="section-subtitle">BLEU, COMET, Average Lagging (AL), and Length-Adaptive AL (LAAL) across languages</p>
+        <p class="section-subtitle">COMET, Average Lagging (AL) and Length-Adaptive AL (LAAL) for your last input — Wait-K vs full-sentence offline</p>
 
-        <div class="metrics-grid" id="metrics-summary"></div>
-
-        <div class="chart-container">
-            <h3 style="margin-bottom: 16px; font-size: 1.1rem;">Quality vs Latency Frontier</h3>
-            <canvas id="bleu-al-chart"></canvas>
-        </div>
-
-        <div class="chart-container">
-            <h3 style="margin-bottom: 16px; font-size: 1.1rem;">BLEU by Language & Policy</h3>
-            <canvas id="bleu-lang-chart"></canvas>
+        <div id="quality-results">
+            <div class="card">
+                <span class="placeholder-text" style="color: var(--text-muted)">
+                    Type a sentence above, then click “Check full sentence” to compare the live Wait-K
+                    output against the offline translation (COMET, AL, LAAL).
+                </span>
+            </div>
         </div>
     </div>
 </section>

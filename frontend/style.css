@@ -361,16 +361,6 @@ textarea::placeholder {
     white-space: pre-wrap;
 }
 
-.output-box .cursor-blink {
-    display: inline-block;
-    width: 2px;
-    height: 1.2em;
-    background: var(--accent-primary);
-    animation: blink 1s step-end infinite;
-    vertical-align: text-bottom;
-    margin-left: 2px;
-}
-
 /* --- Buttons --- */
 .btn {
     padding: 12px 24px;
@@ -613,18 +603,6 @@ textarea::placeholder {
     letter-spacing: 0.05em;
 }
 
-.chart-container {
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid var(--border-glass);
-    border-radius: var(--radius);
-    padding: 24px;
-    margin-bottom: 24px;
-}
-
-.chart-container canvas {
-    max-height: 400px;
-}
-
 /* --- Comparison View --- */
 .comparison-grid {
     display: grid;
@@ -755,10 +733,6 @@ textarea::placeholder {
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
-}
-
-@keyframes blink {
-    50% { opacity: 0; }
 }
 
 @keyframes shimmer {

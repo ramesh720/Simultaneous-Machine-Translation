@@ -1,7 +1,9 @@
 """FastAPI backend for the Simultaneous MT presentation frontend.
 
-Serves translation requests (full-sentence and streaming wait-k) and
-pre-computed evaluation metrics. Runs on port 8080.
+Incremental wait-k decoding: the frontend posts one /step per word as the user
+types, and the server advances the translation by re-using the tokens committed
+so far (so each word costs ~one forward pass). A /quality endpoint compares the
+simultaneous output against a full-sentence offline translation. Port 8080.
 
 Usage:
     python server.py
@@ -10,9 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
-import os
+import math
 import sys
 from pathlib import Path
 
@@ -20,7 +20,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sse_starlette.sse import EventSourceResponse
 
 import torch
 
@@ -34,7 +33,6 @@ from src.waitk import (  # noqa: E402
     build_prompt,
     laal,
     stop_token_ids,
-    wait_k_decode,
 )
 
 # ---------- Globals ----------
@@ -90,138 +88,8 @@ async def languages():
     }
 
 
-@app.post("/api/translate")
-async def translate(request: Request):
-    """Full-sentence (offline) translation."""
-    body = await request.json()
-    text = body.get("text", "").strip()
-    tgt_lang = LANG_MAP.get(body.get("target_lang", "en"), "English")
-
-    if not text:
-        return JSONResponse({"error": "No text provided"}, status_code=400)
-
-    model_device = next(MODEL.parameters()).device
-    prompt = build_prompt(TOKENIZER, text, tgt_lang)
-    enc = TOKENIZER(prompt, return_tensors="pt").to(model_device)
-
-    with torch.inference_mode():
-        gen = MODEL.generate(
-            **enc,
-            max_new_tokens=256,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=TOKENIZER.pad_token_id,
-        )
-    out = TOKENIZER.decode(gen[0, enc.input_ids.shape[1]:], skip_special_tokens=True)
-    translation = out.split("<end_of_turn>")[0].strip()
-
-    return {"translation": translation, "policy": "full", "target_language": tgt_lang}
-
-
-@app.get("/api/translate/stream")
-async def translate_stream(text: str, target_lang: str = "en", k: int = 3):
-    """SSE-streamed wait-k translation with READ/WRITE events."""
-    text = text.strip()
-    tgt_lang = LANG_MAP.get(target_lang, "English")
-
-    if not text:
-        return JSONResponse({"error": "No text provided"}, status_code=400)
-
-    async def event_generator():
-        eos_ids = stop_token_ids(TOKENIZER)
-        src_words = text.split()
-        S = len(src_words)
-        committed = []
-        prev_read = 0
-        model_device = next(MODEL.parameters()).device
-
-        for t in range(1, 257):
-            num_src = min(k + t - 1, S)
-
-            # Emit READ events
-            while prev_read < num_src:
-                prev_read += 1
-                word = src_words[prev_read - 1]
-                yield {
-                    "event": "read",
-                    "data": json.dumps({
-                        "word": word,
-                        "src_read": prev_read,
-                        "src_total": S,
-                    }),
-                }
-                await asyncio.sleep(0.15)  # Delay for animation
-
-            # Generate next token
-            prompt = build_prompt(
-                TOKENIZER, " ".join(src_words[:num_src]), tgt_lang
-            )
-            prompt_ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(model_device)
-            if committed:
-                tail = torch.tensor(
-                    [committed], device=model_device, dtype=prompt_ids.dtype
-                )
-                input_ids = torch.cat([prompt_ids, tail], dim=1)
-            else:
-                input_ids = prompt_ids
-
-            with torch.inference_mode():
-                logits = MODEL(input_ids=input_ids).logits[0, -1]
-            if num_src < S:
-                for eid in eos_ids:
-                    logits[eid] = float("-inf")
-
-            next_id = int(logits.argmax())
-            if next_id in eos_ids:
-                yield {
-                    "event": "stop",
-                    "data": json.dumps({"reason": "eos"}),
-                }
-                break
-
-            committed.append(next_id)
-            token_text = TOKENIZER.decode([next_id], skip_special_tokens=True)
-            full_so_far = TOKENIZER.decode(committed, skip_special_tokens=True).strip()
-
-            yield {
-                "event": "write",
-                "data": json.dumps({
-                    "token": token_text,
-                    "translation_so_far": full_so_far,
-                    "tgt_tokens": len(committed),
-                }),
-            }
-            await asyncio.sleep(0.1)
-
-        # Final summary
-        translation = TOKENIZER.decode(committed, skip_special_tokens=True).strip()
-        yield {
-            "event": "done",
-            "data": json.dumps({
-                "translation": translation,
-                "k": k,
-                "src_words": S,
-                "tgt_tokens": len(committed),
-            }),
-        }
-
-    return EventSourceResponse(event_generator())
-
-
-@app.post("/api/translate/compare")
-async def compare(request: Request):
-    """Side-by-side comparison: full-sentence vs wait-k with latency metrics."""
-    import math
-    body = await request.json()
-    text = body.get("text", "").strip()
-    tgt_lang_code = body.get("target_lang", "en")
-    tgt_lang = LANG_MAP.get(tgt_lang_code, "English")
-    k = body.get("k", 3)
-
-    if not text:
-        return JSONResponse({"error": "No text provided"}, status_code=400)
-
-    # 1. Full-sentence (offline) translation
+def _offline_translate(text: str, tgt_lang: str) -> str:
+    """Full-sentence (offline) greedy translation of ``text`` into ``tgt_lang``."""
     model_device = next(MODEL.parameters()).device
     prompt = build_prompt(TOKENIZER, text, tgt_lang)
     enc = TOKENIZER(prompt, return_tensors="pt").to(model_device)
@@ -231,45 +99,199 @@ async def compare(request: Request):
             num_beams=1, pad_token_id=TOKENIZER.pad_token_id,
         )
     out = TOKENIZER.decode(gen[0, enc.input_ids.shape[1]:], skip_special_tokens=True)
-    full_translation = out.split("<end_of_turn>")[0].strip()
+    return out.split("<end_of_turn>")[0].strip()
 
-    # 2. Wait-K (simultaneous) translation
-    waitk_translation, trace = wait_k_decode(
-        MODEL, TOKENIZER, text, k=k, target_language=tgt_lang, max_target_tokens=256
+
+@torch.inference_mode()
+def _next_token(words_read: list[str], committed: list[int], tgt_lang: str,
+                eos_ids, suppress_eos: bool) -> int:
+    """One greedy decoding step for the current source prefix + committed tokens."""
+    device = next(MODEL.parameters()).device
+    prompt = build_prompt(TOKENIZER, " ".join(words_read), tgt_lang)
+    ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(device)
+    if committed:
+        tail = torch.tensor([committed], device=device, dtype=ids.dtype)
+        ids = torch.cat([ids, tail], dim=1)
+    logits = MODEL(input_ids=ids).logits[0, -1]
+    if suppress_eos:
+        for eid in eos_ids:
+            logits[eid] = float("-inf")
+    return int(logits.argmax())
+
+
+@torch.inference_mode()
+def _generate_tail(words_read: list[str], committed: list[int], tgt_lang: str,
+                   eos_ids, max_new: int = 200) -> list[int]:
+    """Fast KV-cached completion of the translation, continuing from ``committed``
+    and allowing EOS. Used to flush the rest of the sentence on finalize."""
+    device = next(MODEL.parameters()).device
+    prompt = build_prompt(TOKENIZER, " ".join(words_read), tgt_lang)
+    ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(device)
+    if committed:
+        tail = torch.tensor([committed], device=device, dtype=ids.dtype)
+        ids = torch.cat([ids, tail], dim=1)
+    gen = MODEL.generate(
+        input_ids=ids, max_new_tokens=max_new, do_sample=False,
+        num_beams=1, pad_token_id=TOKENIZER.pad_token_id,
     )
+    out = []
+    for t in gen[0, ids.shape[1]:].tolist():
+        if t in eos_ids:
+            break
+        out.append(t)
+    return out
 
-    # 3. Compute latency metrics
-    num_src_words = len(text.split())
-    al_score = average_lagging(trace, num_src_words)
-    laal_score = laal(trace, num_src_words)
-    al_val = None if math.isnan(al_score) else round(al_score, 2)
-    laal_val = None if math.isnan(laal_score) else round(laal_score, 2)
 
+@app.post("/api/translate/step")
+async def translate_step(request: Request):
+    """Advance the wait-k translation by the words newly available since the
+    last call. Stateless: the client passes back the tokens committed so far.
+
+    Body: {words: [str], committed: [int], read: int, k, target_lang, finalize}
+    - During typing (finalize=false) EOS is suppressed and we emit at most
+      ``read - k + 1`` tokens (the wait-k schedule: write 1 token per word read
+      after the initial k-word lag).
+    - On finalize (typing paused) all remaining words are read and the tail is
+      generated until EOS, completing the sentence.
+    """
+    body = await request.json()
+    words = [w for w in body.get("words", []) if w]
+    tgt_lang = LANG_MAP.get(body.get("target_lang", "en"), "English")
+    k = max(1, int(body.get("k", 3)))
+    committed = [int(x) for x in body.get("committed", [])]
+    read = int(body.get("read", 0))
+    finalize = bool(body.get("finalize", False))
+
+    n = len(words)
+    eos_ids = stop_token_ids(TOKENIZER)
+
+    # READ the newly typed words
+    reads = []
+    while read < n:
+        read += 1
+        reads.append(words[read - 1])
+
+    # WRITE new target tokens.
+    writes = []
+
+    def _record(token_id):
+        committed.append(token_id)
+        so_far = TOKENIZER.decode(committed, skip_special_tokens=True).strip()
+        writes.append({
+            "token": TOKENIZER.decode([token_id], skip_special_tokens=True),
+            "translation_so_far": so_far,
+            "src_read": read,
+        })
+
+    if finalize:
+        # Flush the rest of the sentence with fast KV-cached generation.
+        for token_id in _generate_tail(words[:read], committed, tgt_lang, eos_ids):
+            _record(token_id)
+    else:
+        # Live wait-k: emit up to (read - k + 1) tokens (one per word read past
+        # the initial k-word lag), suppressing EOS so it can't end early.
+        target = min(max(0, read - k + 1), 256)
+        while len(committed) < target:
+            next_id = _next_token(words[:read], committed, tgt_lang,
+                                  eos_ids, suppress_eos=True)
+            if next_id in eos_ids:
+                break
+            _record(next_id)
+
+    translation = TOKENIZER.decode(committed, skip_special_tokens=True).strip()
     return {
-        "full_translation": full_translation,
-        "waitk_translation": waitk_translation,
-        "metrics": {"al": al_val, "laal": laal_val, "src_words": num_src_words, "k": k},
+        "committed": committed,
+        "read": read,
+        "reads": reads,
+        "writes": writes,
+        "translation_so_far": translation,
+        "src_total": n,
+        "done": finalize,
     }
 
 
-@app.get("/api/metrics")
-async def metrics():
-    """Return pre-computed evaluation metrics from metrics_summary.json."""
-    metrics_paths = [
-        ROOT / "eval_results" / "metrics_summary.json",
-        ROOT / "eval_results_adaptive" / "metrics_summary.json",
-    ]
-    for p in metrics_paths:
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                return json.load(f)
+_COMET_MODEL = None
 
-    # Return sample data if no evaluation has been run yet
+
+def _get_comet():
+    """Lazily load COMET once. Runs on CPU so it doesn't fight the 4B model for
+    the 6 GB GPU. Returns None if unbabel-comet isn't installed."""
+    global _COMET_MODEL
+    if _COMET_MODEL is None:
+        from comet import download_model, load_from_checkpoint
+        path = download_model("Unbabel/wmt22-comet-da")
+        _COMET_MODEL = load_from_checkpoint(path)
+    return _COMET_MODEL
+
+
+def _waitk_trace(tgt_tokens: int, src_words: int, k: int):
+    """Reconstruct the wait-k READ/WRITE trace for latency metrics: target token
+    ``t`` (1-indexed) is written after reading ``min(k + t - 1, S)`` words."""
+    trace, read = [], 0
+    for t in range(1, tgt_tokens + 1):
+        target_read = min(k + t - 1, src_words)
+        while read < target_read:
+            read += 1
+            trace.append(("READ", ""))
+        trace.append(("WRITE", ""))
+    while read < src_words:
+        read += 1
+        trace.append(("READ", ""))
+    return trace
+
+
+@app.post("/api/translate/quality")
+async def translate_quality(request: Request):
+    """Full-sentence (offline) translation + COMET/AL/LAAL for the wait-k output.
+
+    The offline translation is used as the COMET reference, so COMET measures how
+    much quality the simultaneous (wait-k) output gives up. AL/LAAL are latency
+    metrics derived from the wait-k schedule (tgt_tokens, src_words, k).
+    """
+    body = await request.json()
+    text = body.get("text", "").strip()
+    tgt_lang = LANG_MAP.get(body.get("target_lang", "en"), "English")
+    waitk_translation = body.get("waitk_translation", "").strip()
+    tgt_tokens = int(body.get("tgt_tokens", 0))
+    k = max(1, int(body.get("k", 3)))
+
+    if not text:
+        return JSONResponse({"error": "No text provided"}, status_code=400)
+
+    src_words = len(text.split())
+    full_translation = _offline_translate(text, tgt_lang)
+
+    # Latency metrics from the wait-k schedule
+    trace = _waitk_trace(tgt_tokens, src_words, k)
+    al_score = average_lagging(trace, src_words)
+    laal_score = laal(trace, src_words)
+
+    # COMET quality: wait-k hypothesis vs offline reference (CPU; may be slow)
+    comet = None
+    comet_error = None
+    if waitk_translation and full_translation:
+        try:
+            model = _get_comet()
+            out = model.predict(
+                [{"src": text, "mt": waitk_translation, "ref": full_translation}],
+                batch_size=1, gpus=0,
+            )
+            comet = round(float(out.system_score), 3)
+        except ImportError:
+            comet_error = "unbabel-comet not installed (pip install unbabel-comet)"
+        except Exception as exc:  # noqa: BLE001 — report, don't crash the request
+            import traceback
+            traceback.print_exc()
+            comet_error = f"{type(exc).__name__}: {exc}"
+
     return {
-        "base": "sarvamai/sarvam-translate",
-        "adapter": None,
-        "note": "No evaluation results found. Run run_full_pipeline.sh first.",
-        "results": [],
+        "full_translation": full_translation,
+        "comet": comet,
+        "comet_error": comet_error,
+        "al": None if math.isnan(al_score) else round(al_score, 2),
+        "laal": None if math.isnan(laal_score) else round(laal_score, 2),
+        "src_words": src_words,
+        "k": k,
     }
 
 
@@ -340,8 +362,11 @@ def main():
         use_4bit = False
 
     print(f"[server] Loading model on {DEVICE} (4-bit={use_4bit})...")
+    # eager is the safe, proven config for this model; the main speedup is the
+    # incremental /step decoding plus loading in bf16 (see load.py).
     MODEL, TOKENIZER = load_model(
-        args.base, args.adapter, device=DEVICE, quantize_4bit=use_4bit
+        args.base, args.adapter, device=DEVICE, quantize_4bit=use_4bit,
+        attn_implementation="eager",
     )
     print(f"[server] Model loaded. Starting server on {args.host}:{args.port}")
     print(f"[server] Open http://localhost:{args.port} in your browser")

@@ -53,6 +53,12 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--tokenize", default="intl", help="sacrebleu tokenizer (intl matches IN22)")
     p.add_argument("--limit", type=int, default=None, help="evaluate first N sentences")
+    p.add_argument("--quantize-4bit", action="store_true", default=False,
+                   help="Load the model in 4-bit (needed for GPUs with < 8 GB VRAM)")
+    p.add_argument("--no-quantize", action="store_true", default=False,
+                   help="Force full precision even on small GPUs")
+    p.add_argument("--no-comet", action="store_true", default=False,
+                   help="Skip COMET scoring (avoids a ~2 GB download and extra VRAM)")
     return p.parse_args()
 
 
@@ -126,14 +132,15 @@ def evaluate_policy(model, tokenizer, state, sources, references, tgt_lang,
 
     # COMET scoring (on main process only)
     comet_score = None
-    try:
-        comet_result = score_comet(sources, hyps, references, gpus=1)
-        if comet_result:
-            comet_score = comet_result["system_score"]
-    except Exception as e:
-        print(f"  [comet] skipped: {e}")
+    if not getattr(args, "no_comet", False):
+        try:
+            comet_result = score_comet(sources, hyps, references, gpus=1)
+            if comet_result:
+                comet_score = comet_result["system_score"]
+        except Exception as e:
+            print(f"  [comet] skipped: {e}")
 
-    records = [{"input": sources[i], "reference": references[i], "hypothesis": h,
+    records = [{"input": sources[r[0]], "reference": references[r[0]], "hypothesis": h,
                 "AL": r[2], "LAAL": r[3] if len(r) > 3 else None}
                for (r, h) in zip(gathered, hyps)]
     row = {"policy": tag, "k": (None if policy == "full" else k),
@@ -148,9 +155,21 @@ def main():
     out_dir = Path(args.out_dir)
     (out_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
+    # Auto-detect quantization need based on available VRAM (mirrors the server).
+    if args.no_quantize:
+        use_4bit = False
+    elif args.quantize_4bit:
+        use_4bit = True
+    elif torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        use_4bit = vram_gb < 8.0
+    else:
+        use_4bit = False
+
     if state.is_main_process:
-        print(f"Loading {args.base} on {state.num_processes} GPU(s) ...")
-    model, tokenizer = load_model(args.base, args.adapter, device=str(state.device))
+        print(f"Loading {args.base} on {state.num_processes} GPU(s) (4-bit={use_4bit}) ...")
+    model, tokenizer = load_model(args.base, args.adapter, device=str(state.device),
+                                  quantize_4bit=use_4bit)
 
     summary = []
     for ds in args.datasets:

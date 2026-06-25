@@ -3,193 +3,79 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SimulMT — Simultaneous Machine Translation</title>
-    <meta name="description" content="Interactive demonstration of Simultaneous Machine Translation using Wait-K policy with SimulMask attention masking for Telugu, Hindi, Gujarati, and Tamil.">
+    <meta name="color-scheme" content="light">
+    <title>Simultaneous Translation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<main class="app">
 
-<!-- ===== HERO ===== -->
-<section class="hero">
-    <div class="container">
-        <div class="hero-badge">
-            <span class="dot"></span>
-            SimulMask + Wait-K Policy
-        </div>
-        <h1>
-            <span class="gradient-text">Simultaneous</span><br>
-            Machine Translation
-        </h1>
-        <p>
-            Real-time translation for Indian languages using Wait-K decoding with
-            SimulMask attention masking — translating before the speaker finishes.
-        </p>
-        <div class="hero-stats">
-            <div class="hero-stat">
-                <div class="value">4</div>
-                <div class="label">Languages</div>
-            </div>
-            <div class="hero-stat">
-                <div class="value">8</div>
-                <div class="label">Directions</div>
-            </div>
-            <div class="hero-stat">
-                <div class="value">SimulMask</div>
-                <div class="label">Training Method</div>
-            </div>
-            <div class="hero-stat">
-                <div class="value">COMET</div>
-                <div class="label">Neural Metric</div>
+    <header class="app-bar">
+        <div class="app-bar-lead">
+            <span class="material-symbols-outlined app-bar-icon">graphic_eq</span>
+            <div class="brand">
+                <h1>Simultaneous Translation</h1>
+                <p>Streaming wait-k translation for Indian languages — output begins before the sentence ends.</p>
             </div>
         </div>
-    </div>
-</section>
-
-<!-- ===== PIPELINE DIAGRAM ===== -->
-<section id="pipeline-section">
-    <div class="container">
-        <h2 class="section-title">Translation Pipeline</h2>
-        <p class="section-subtitle">How simultaneous translation works at the machine translation level</p>
-        <div class="pipeline" id="pipeline">
-            <div class="pipeline-step" id="pipe-source">
-                <span class="icon">📝</span>
-                <span class="step-name">Source Text</span>
-            </div>
-            <span class="pipeline-arrow">→</span>
-            <div class="pipeline-step" id="pipe-read">
-                <span class="icon">👁️</span>
-                <span class="step-name">READ Words</span>
-            </div>
-            <span class="pipeline-arrow">→</span>
-            <div class="pipeline-step" id="pipe-mask">
-                <span class="icon">🎭</span>
-                <span class="step-name">SimulMask</span>
-            </div>
-            <span class="pipeline-arrow">→</span>
-            <div class="pipeline-step" id="pipe-policy">
-                <span class="icon">⚡</span>
-                <span class="step-name">Wait-K Policy</span>
-            </div>
-            <span class="pipeline-arrow">→</span>
-            <div class="pipeline-step" id="pipe-write">
-                <span class="icon">✍️</span>
-                <span class="step-name">WRITE Tokens</span>
-            </div>
-            <span class="pipeline-arrow">→</span>
-            <div class="pipeline-step" id="pipe-target">
-                <span class="icon">🌍</span>
-                <span class="step-name">Translation</span>
-            </div>
+        <div class="status-wrap">
+            <span id="status" class="status"></span>
+            <span class="meta">sarvam-translate · Gemma 3</span>
         </div>
-    </div>
-</section>
+    </header>
 
-<!-- ===== LIVE DEMO ===== -->
-<section id="demo-section">
-    <div class="container">
-        <h2 class="section-title">Live Translation Demo</h2>
-        <p class="section-subtitle">Just start typing — translation appears live under the Wait-K policy, revising itself as you go</p>
+    <section class="console">
 
-        <div class="card">
-            <!-- Language Selection -->
-            <div class="direction-toggle">
-                <span class="direction-label" id="src-lang-label">Source</span>
-                <div class="lang-selector" id="src-lang-selector"></div>
-                <span class="arrow" id="swap-direction" title="Swap direction">⇄</span>
-                <span class="direction-label" id="tgt-lang-label">Target</span>
-                <div class="lang-selector" id="tgt-lang-selector"></div>
-            </div>
-
-            <!-- K Selector -->
-            <div class="k-selector">
-                <label for="k-slider">Wait-K value:</label>
-                <input type="range" id="k-slider" min="1" max="9" value="3" step="2">
-                <span class="k-value" id="k-display">k=3</span>
-            </div>
-
-            <!-- Example Sentences -->
-            <div class="examples-bar" id="examples-bar"></div>
-
-            <!-- Action Buttons -->
-            <div class="btn-group">
-                <button class="btn btn-secondary" id="btn-clear" onclick="clearAll()">
-                    ✕ Clear
+        <div class="controls">
+            <div class="pair">
+                <label class="select-field">
+                    <select id="src-lang" class="select" aria-label="Source language"></select>
+                </label>
+                <button id="swap" class="icon-btn swap" title="Swap languages" aria-label="Swap languages">
+                    <span class="material-symbols-outlined">swap_horiz</span>
                 </button>
+                <label class="select-field">
+                    <select id="tgt-lang" class="select" aria-label="Target language"></select>
+                </label>
             </div>
+            <div class="lag">
+                <label for="k-slider">Latency</label>
+                <input type="range" id="k-slider" min="1" max="5" step="1" value="3">
+                <span id="k-display" class="lag-value">wait-3</span>
+            </div>
+        </div>
 
-            <!-- Input/Output -->
-            <div class="translation-grid">
-                <div class="input-area">
-                    <span class="area-label" id="input-label">Source (Telugu)</span>
-                    <textarea id="source-input" placeholder="Start typing here — translation is live..."></textarea>
-                </div>
-                <div class="output-area">
-                    <span class="area-label" id="output-label">Translation (English)</span>
-                    <div class="output-box" id="translation-output">
-                        <span class="placeholder-text" style="color: var(--text-muted)">Translation will appear here as you type...</span>
+        <div class="io">
+            <div class="pane">
+                <span class="pane-label" id="src-label">Telugu</span>
+                <div class="field">
+                    <textarea id="source-input" spellcheck="false"
+                              placeholder="Type, or speak…"></textarea>
+                    <div class="field-actions">
+                        <div id="waveform" class="waveform" aria-hidden="true"></div>
+                        <button id="clear-btn" class="text-btn" title="Clear & stop">Clear</button>
+                        <button id="mic-btn" class="mic fab" title="Speak" aria-label="Speak"></button>
                     </div>
                 </div>
+                <div class="examples" id="examples"></div>
             </div>
 
-            <!-- Status -->
-            <div class="status-bar" id="status-bar">
-                <span class="status-dot"></span>
-                <span id="status-text">Ready</span>
-            </div>
-
-            <!-- Trace Panel -->
-            <div class="trace-panel">
-                <div class="trace-header">
-                    <span class="trace-title">READ / WRITE Trace</span>
-                    <span id="trace-stats" style="font-size: 0.8rem; color: var(--text-muted)"></span>
+            <div class="pane out">
+                <span class="pane-label" id="tgt-label">English</span>
+                <div class="field">
+                    <div id="translation-output" class="translation"></div>
                 </div>
-                <div class="trace-container" id="trace-container">
-                    <div style="color: var(--text-muted); font-style: italic;">
-                        READ / WRITE steps will appear here as you type…
-                    </div>
-                </div>
-            </div>
-
-            <!-- Full-sentence check (appears 2s after typing pauses) -->
-            <div class="btn-group" id="quality-action" style="display: none; margin-top: 16px;">
-                <button class="btn btn-primary" id="btn-check-quality" onclick="checkQuality()">
-                    📊 Check full sentence
-                </button>
+                <div class="readout" id="readout"></div>
             </div>
         </div>
-    </div>
-</section>
 
-<!-- ===== METRICS (LIVE, PER-SESSION) ===== -->
-<section id="metrics-section">
-    <div class="container">
-        <h2 class="section-title">Evaluation Metrics</h2>
-        <p class="section-subtitle">COMET, Average Lagging (AL) and Length-Adaptive AL (LAAL) for your last input — Wait-K vs full-sentence offline</p>
+    </section>
 
-        <div id="quality-results">
-            <div class="card">
-                <span class="placeholder-text" style="color: var(--text-muted)">
-                    Type a sentence above, then click “Check full sentence” to compare the live Wait-K
-                    output against the offline translation (COMET, AL, LAAL).
-                </span>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- ===== FOOTER ===== -->
-<footer class="footer">
-    <div class="container">
-        <p>
-            Simultaneous Machine Translation — Wait-K + SimulMask + COMET + LAAL<br>
-            <a href="https://github.com/chiranjeevi-sagi/Simultaneous-Machine-Translation" target="_blank">
-                GitHub Repository
-            </a>
-            · Built with sarvam-translate (Gemma3-4B)
-        </p>
-    </div>
-</footer>
-
+</main>
 <script src="/static/app.js"></script>
 </body>
 </html>

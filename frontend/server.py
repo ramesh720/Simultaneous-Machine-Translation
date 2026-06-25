@@ -12,11 +12,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import math
+import os
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+import httpx
+import numpy as np
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,6 +45,25 @@ MODEL = None
 TOKENIZER = None
 DEVICE = None
 
+# faster-whisper ASR. In remote-LLM mode the GPU is free, so this runs on CUDA
+# (float16) for blazing-fast transcription; in local-MT mode it falls back to CPU.
+WHISPER = None
+WHISPER_MODEL = "base"
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE = "int8"
+
+# ---------- Translation backend ----------
+# Remote OpenAI-compatible LLM is the primary translation engine; the local 4B
+# model is an automatic fallback (lazy-loaded only if the remote is unreachable).
+TRANSLATE_BACKEND = "auto"          # auto | remote | local
+API_URL = "http://64.247.196.173:8080/v1"
+API_KEY = "EMPTY"
+API_MODEL = None                    # auto-discovered from /v1/models at startup
+USE_REMOTE = False                  # decided in main() by _probe_remote()
+REMOTE_OK = False                   # flips False if the remote fails at runtime
+_HTTP = None                        # lazy httpx.AsyncClient
+_LOCAL_ARGS = {}                    # captured in main() for lazy fallback load
+
 LANG_MAP = {
     "te": "Telugu",
     "hi": "Hindi",
@@ -60,9 +84,138 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=str(HERE)), name="static")
 
 
+# =============================================================================
+# Translation backend: remote OpenAI-compatible LLM (primary) + local fallback.
+# =============================================================================
+def _http_client() -> httpx.AsyncClient:
+    global _HTTP
+    if _HTTP is None:
+        _HTTP = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+    return _HTTP
+
+
+def _probe_remote() -> bool:
+    """Startup check: confirm the remote LLM answers and discover its model id.
+    Returns True if it can be used for translation."""
+    global API_MODEL
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(8.0, connect=5.0)) as c:
+            if API_MODEL is None:                      # discover served model id
+                try:
+                    m = c.get(f"{API_URL}/models", headers=headers)
+                    if m.status_code == 200:
+                        items = m.json().get("data", [])
+                        if items:
+                            API_MODEL = items[0].get("id")
+                except Exception:
+                    pass
+            ping = c.post(
+                f"{API_URL}/chat/completions", headers=headers,
+                json={"model": API_MODEL or "default", "max_tokens": 1,
+                      "temperature": 0,
+                      "messages": [{"role": "user", "content": "Hi"}]},
+            )
+            ping.raise_for_status()
+            return True
+    except Exception as exc:  # noqa: BLE001 — probe is best-effort
+        print(f"[server] Remote LLM probe failed ({type(exc).__name__}: {exc}).")
+        return False
+
+
+async def _remote_translate(text: str, target_language: str,
+                            max_tokens: int = 256) -> str:
+    """Translate ``text`` via the remote OpenAI-compatible chat endpoint.
+
+    Mirrors src.waitk.build_prompt's instruction so output matches the local
+    model. Raises on any transport/HTTP error so the caller can fall back."""
+    payload = {
+        "model": API_MODEL or "default",
+        "messages": [
+            {"role": "system",
+             "content": f"Translate the text below to {target_language}. "
+                        "Output only the translation, with no quotes or notes."},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    r = await _http_client().post(
+        f"{API_URL}/chat/completions", json=payload,
+        headers={"Authorization": f"Bearer {API_KEY}"},
+    )
+    r.raise_for_status()
+    data = r.json()
+    return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+def _ensure_local():
+    """Lazy-load the local 4B model the first time the remote fails. No-op if
+    it is already loaded. This is the demo's safety net."""
+    global MODEL, TOKENIZER
+    if MODEL is not None:
+        return
+    print("[server] Loading LOCAL fallback model (remote unavailable)...")
+    MODEL, TOKENIZER = load_model(
+        _LOCAL_ARGS.get("base", "sarvamai/sarvam-translate"),
+        _LOCAL_ARGS.get("adapter"), device=DEVICE,
+        quantize_4bit=_LOCAL_ARGS.get("use_4bit", True),
+        attn_implementation="eager",
+    )
+    print("[server] Local fallback model ready.")
+
+
+async def _translate_full(text: str, target_language: str) -> str:
+    """Full-string translation, remote-first with automatic local fallback.
+
+    Used for the remote wait-k path (prefix re-translation) and offline
+    translation. Returns '' for empty input."""
+    global REMOTE_OK
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if USE_REMOTE:
+        try:
+            return await _remote_translate(text, target_language)
+        except Exception as exc:  # noqa: BLE001 — degrade to local, don't crash
+            print(f"[server] Remote translate failed → local fallback "
+                  f"({type(exc).__name__}: {exc}).")
+            REMOTE_OK = False
+            _ensure_local()
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _offline_translate, text, target_language)
+
+
+async def _step_remote(words: list[str], tgt_lang: str, k: int,
+                       finalize: bool) -> dict:
+    """Wait-k via prefix re-translation for the remote (black-box) backend.
+
+    The whole source prefix read so far is translated each step; the wait-k
+    lag knob is honoured by withholding output until ``k`` words are available.
+    Returns the same JSON shape as the local /step so the client is unchanged."""
+    n = len(words)
+    if not finalize and n < k:
+        out = ""                                       # wait-k lag (READ phase)
+    else:
+        out = await _translate_full(" ".join(words), tgt_lang)
+    return {
+        "committed": [], "read": n, "reads": [], "writes": [],
+        "translation_so_far": out, "src_total": n, "done": finalize,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (HERE / "index.html").read_text()
+
+
+@app.get("/api/backend")
+async def backend_info():
+    """Which translation engine is live (so the UI can show it)."""
+    return {"backend": "remote" if (USE_REMOTE and REMOTE_OK) else "local",
+            "model": API_MODEL if (USE_REMOTE and REMOTE_OK) else "sarvam-translate",
+            "whisper": {"model": WHISPER_MODEL, "device": WHISPER_DEVICE}}
 
 
 @app.get("/api/languages")
@@ -90,6 +243,7 @@ async def languages():
 
 def _offline_translate(text: str, tgt_lang: str) -> str:
     """Full-sentence (offline) greedy translation of ``text`` into ``tgt_lang``."""
+    _ensure_local()                       # remote mode: load the model on demand
     model_device = next(MODEL.parameters()).device
     prompt = build_prompt(TOKENIZER, text, tgt_lang)
     enc = TOKENIZER(prompt, return_tensors="pt").to(model_device)
@@ -158,9 +312,15 @@ async def translate_step(request: Request):
     words = [w for w in body.get("words", []) if w]
     tgt_lang = LANG_MAP.get(body.get("target_lang", "en"), "English")
     k = max(1, int(body.get("k", 3)))
+    finalize = bool(body.get("finalize", False))
+
+    # Remote backend: stateless prefix re-translation (no token-level decode).
+    if USE_REMOTE and REMOTE_OK:
+        return await _step_remote(words, tgt_lang, k, finalize)
+
+    # ----- Local backend (unchanged token-level wait-k) -----
     committed = [int(x) for x in body.get("committed", [])]
     read = int(body.get("read", 0))
-    finalize = bool(body.get("finalize", False))
 
     n = len(words)
     eos_ids = stop_token_ids(TOKENIZER)
@@ -208,6 +368,28 @@ async def translate_step(request: Request):
         "src_total": n,
         "done": finalize,
     }
+
+
+@app.post("/api/translate/correct")
+async def translate_correct(request: Request):
+    """Re-translate the *whole* finished sentence as one offline pass.
+
+    Triggered by the client after a typing pause long enough to mean "the
+    sentence is done" (~3 s). Wait-k commits tokens left-to-right before the
+    full source is seen, so at low k it tends to mirror the English S-V-O order
+    even for SOV Indic targets. This pass sees the complete sentence, so it can
+    place the verb last and otherwise fix the order the streaming output guessed
+    wrong. It does NOT touch the wait-k decode state, so if the user keeps
+    typing the live stream simply resumes from where it was.
+
+    Body: {text: str, target_lang: str} → {translation: str}
+    """
+    body = await request.json()
+    text = (body.get("text", "") or "").strip()
+    tgt_lang = LANG_MAP.get(body.get("target_lang", "en"), "English")
+    if not text:
+        return {"translation": ""}
+    return {"translation": await _translate_full(text, tgt_lang)}
 
 
 _COMET_MODEL = None
@@ -329,6 +511,323 @@ async def examples():
     }
 
 
+# =============================================================================
+# Live speech → simultaneous translation (faster-whisper → wait-k / remote MT)
+#
+# The browser streams 16 kHz mono int16 PCM over a WebSocket. Instead of
+# re-transcribing the whole growing utterance every update (which got slower and
+# slower as you spoke — O(n²) audio overall — and made the server fall behind
+# real time), StreamingASR re-runs Whisper only on the *uncommitted tail* of the
+# audio, capped at MAX_WINDOW_S, and freezes words with LocalAgreement-2. So the
+# per-update cost stays flat no matter how long the utterance is. Each new stable
+# word drives the same translation path as the typed demo, so output appears
+# while you speak. Speed comes from: bounded re-transcription, GPU float16 when
+# the remote LLM frees the GPU, a *pinned* source language (no per-chunk
+# auto-detect), Silero VAD to skip silence, and skipping the remote re-translate
+# when no new stable word has appeared.
+# =============================================================================
+SR = 16_000                                   # browser sends 16 kHz mono
+RETRANSCRIBE_BYTES = int(SR * 2 * 0.8)        # re-run ASR every ~0.8 s of new audio
+MAX_WINDOW_S = 16.0                           # cap audio fed to Whisper per update
+ASR_LANGS = {"te", "hi", "gu", "ta", "en"}    # codes faster-whisper accepts here
+
+
+def _whisper_lang(code):
+    """Map a UI source-language code to a pinned Whisper language (or None=auto)."""
+    return code if code in ASR_LANGS else None
+
+
+def _get_whisper():
+    """Lazily load faster-whisper once, with a GPU→CPU fallback.
+
+    On the 6 GB card the 4B MT model leaves ~2 GB free — more than enough for a
+    memory-light ``int8_float16`` Whisper, which is ~10× faster than CPU. If the
+    GPU load fails (OOM / driver), we silently retry on CPU so live speech still
+    works. Raises only if the package is missing or both devices fail.
+    """
+    global WHISPER, WHISPER_DEVICE, WHISPER_COMPUTE
+    if WHISPER is None:
+        from faster_whisper import WhisperModel
+        attempts = [(WHISPER_DEVICE, WHISPER_COMPUTE)]
+        if WHISPER_DEVICE == "cuda":
+            attempts.append(("cpu", "int8"))          # OOM / driver safety net
+        last_exc = None
+        for dev, comp in attempts:
+            try:
+                print(f"[asr] loading faster-whisper '{WHISPER_MODEL}' on "
+                      f"{dev} ({comp})...")
+                kwargs = {}
+                if dev == "cpu":
+                    kwargs["cpu_threads"] = min(8, os.cpu_count() or 4)
+                WHISPER = WhisperModel(WHISPER_MODEL, device=dev,
+                                       compute_type=comp, **kwargs)
+                WHISPER_DEVICE, WHISPER_COMPUTE = dev, comp
+                break
+            except Exception as exc:  # noqa: BLE001 — try the next device
+                last_exc = exc
+                print(f"[asr] load on {dev} failed "
+                      f"({type(exc).__name__}: {exc}); trying next device.")
+        if WHISPER is None:
+            raise last_exc
+    return WHISPER
+
+
+def _stable_words(text: str, is_final: bool) -> list[str]:
+    """Words safe to translate: drop the last (still-unstable) word on partials."""
+    words = text.split()
+    return words if is_final else (words[:-1] if len(words) > 1 else [])
+
+
+class StreamingASR:
+    """Bounded, incremental ASR for live speech.
+
+    The old path re-transcribed the *entire* growing utterance on every update,
+    so per-update cost climbed with utterance length and the server fell behind
+    real time. This keeps the cost flat by:
+
+      • running Whisper only on the uncommitted *tail* of the audio, capped at
+        MAX_WINDOW_S seconds (older audio is trimmed away once its words are
+        committed);
+      • committing words with LocalAgreement-2 — a word is frozen only once two
+        consecutive transcriptions agree on it (Macháček et al., 2020) — and
+        feeding the committed text back as Whisper's ``initial_prompt`` so
+        context survives the trim.
+
+    ``transcribe`` returns ``(full_text, language)`` where ``full_text`` is the
+    frozen committed prefix plus the current (still-mutable) tail.
+    """
+
+    def __init__(self, language=None):
+        self.language = language
+        self.audio = np.zeros(0, dtype=np.float32)   # uncommitted tail
+        self.committed: list[str] = []               # frozen words
+        self.prev_tail: list[str] = []               # last hypothesis tail words
+        self.lang = language
+
+    def add_audio(self, pcm_bytes: bytes):
+        a = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        self.audio = np.concatenate([self.audio, a])
+
+    @property
+    def committed_text(self) -> str:
+        return " ".join(self.committed)
+
+    def _hyp(self):
+        """Transcribe the current (capped) window → list of (word, end_time)."""
+        model = _get_whisper()
+        max_samples = int(MAX_WINDOW_S * SR)
+        if len(self.audio) > max_samples:        # safety valve for endless speech
+            self.audio = self.audio[-max_samples:]
+        segments, info = model.transcribe(
+            self.audio, language=self.language, beam_size=1,
+            condition_on_previous_text=False,
+            initial_prompt=self.committed_text[-200:] or None,
+            word_timestamps=True,
+            vad_filter=True, vad_parameters={"min_silence_duration_ms": 300},
+        )
+        self.lang = info.language
+        words = []
+        for seg in segments:
+            for w in (seg.words or []):
+                t = w.word.strip()
+                if t:
+                    words.append((t, w.end))
+        return words
+
+    def transcribe(self, is_final: bool = False):
+        hyp = self._hyp()
+        if is_final:                              # flush everything on stop
+            self.committed.extend(w for w, _ in hyp)
+            self.prev_tail = []
+            self.audio = np.zeros(0, dtype=np.float32)
+            return self.committed_text, self.lang
+
+        # LocalAgreement-2: confirm the longest prefix this run shares with the
+        # previous one, but never the final word (still settling).
+        n = 0
+        for i in range(min(len(hyp), len(self.prev_tail))):
+            if hyp[i][0] == self.prev_tail[i]:
+                n = i + 1
+            else:
+                break
+        n = min(n, max(0, len(hyp) - 1))
+
+        if n:
+            cut_end = hyp[n - 1][1]               # end time of last confirmed word
+            self.committed.extend(w for w, _ in hyp[:n])
+            cut = min(len(self.audio), int(cut_end * SR))
+            self.audio = self.audio[cut:]         # drop the committed audio
+            self.prev_tail = [w for w, _ in hyp[n:]]
+        else:
+            self.prev_tail = [w for w, _ in hyp]
+
+        full = (self.committed_text + " " + " ".join(self.prev_tail)).strip()
+        return full, self.lang
+
+
+class StreamingDecoder:
+    """Per-connection incremental wait-k decoder over a *growing* word list.
+
+    Mirrors the typed-demo /step logic and src.waitk semantics: target token
+    ``t`` (1-indexed) is committed only once ``k + t - 1`` source words are
+    available (or the utterance is final). Committed tokens are never revised.
+    """
+
+    def __init__(self):
+        self.committed: list[int] = []
+        self.finished = False
+
+    @property
+    def text(self) -> str:
+        return TOKENIZER.decode(self.committed, skip_special_tokens=True).strip()
+
+    @torch.inference_mode()
+    def feed(self, src_words: list[str], target_language: str, k: int,
+             is_final: bool, max_tokens: int = 256):
+        if self.finished:
+            return
+        device = next(MODEL.parameters()).device
+        eos_ids = stop_token_ids(TOKENIZER)
+        S = len(src_words)
+        while len(self.committed) < max_tokens:
+            t = len(self.committed) + 1
+            needed = k + t - 1
+            if not is_final and S < needed:
+                break                          # wait for more source words (READ)
+            num_src = min(needed, S)
+            if num_src == 0:
+                break
+            prompt = build_prompt(TOKENIZER, " ".join(src_words[:num_src]),
+                                  target_language)
+            ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(device)
+            if self.committed:
+                tail = torch.tensor([self.committed], device=device, dtype=ids.dtype)
+                ids = torch.cat([ids, tail], dim=1)
+            logits = MODEL(input_ids=ids).logits[0, -1]
+            # Forbid EOS until the utterance is final AND all source is read.
+            if not (is_final and num_src >= S):
+                for eid in eos_ids:
+                    logits[eid] = float("-inf")
+            next_id = int(logits.argmax())
+            if next_id in eos_ids:
+                self.finished = True
+                break
+            self.committed.append(next_id)
+
+
+def _process_local(asr: StreamingASR, decoder: StreamingDecoder,
+                   target_lang: str, k: int, is_final: bool):
+    """Bounded streaming ASR + local token-level wait-k decode.
+
+    Runs in a worker thread so the asyncio event loop keeps draining audio. The
+    last (still-unstable) transcript word is held back so committed tokens aren't
+    built on a word ASR might still revise.
+    """
+    text, lang = asr.transcribe(is_final=is_final)
+    feed_words = _stable_words(text, is_final)
+    decoder.feed(feed_words, target_language=target_lang, k=k, is_final=is_final)
+    return text, lang, decoder.text
+
+
+async def _process_remote(loop, asr: StreamingASR, target_lang: str, k: int,
+                          is_final: bool, last_fed: int):
+    """Bounded streaming ASR (worker thread) + remote prefix re-translation.
+
+    Skips the HTTP translate call during the wait-k READ phase and whenever no
+    new *stable* word has appeared since the last call, so the remote isn't hit
+    on every partial. Returns ``(text, lang, translation_or_None, new_last_fed)``;
+    a ``None`` translation means "leave the displayed output unchanged".
+    """
+    text, lang = await loop.run_in_executor(None, asr.transcribe, is_final)
+    feed = _stable_words(text, is_final)
+    if not is_final and (len(feed) < k or len(feed) <= last_fed):
+        return text, lang, None, last_fed
+    translation = await _translate_full(" ".join(feed), target_lang)
+    return text, lang, translation, len(feed)
+
+
+@app.websocket("/api/asr")
+async def asr_ws(ws: WebSocket):
+    await ws.accept()
+    loop = asyncio.get_event_loop()
+
+    asr = StreamingASR()        # bounded incremental ASR for this connection
+    decoder = StreamingDecoder()
+    target_lang = "English"
+    k = 3
+    recording = False
+    pending = 0                 # bytes of new audio since the last transcription
+    last_fed = 0                # stable words already sent to the remote translator
+
+    async def run(is_final):
+        """One ASR (+translation) update, routed to the live backend."""
+        nonlocal last_fed
+        if USE_REMOTE and REMOTE_OK:
+            text, lang, translation, last_fed = await _process_remote(
+                loop, asr, target_lang, k, is_final, last_fed)
+            return text, lang, translation
+        return await loop.run_in_executor(
+            None, _process_local, asr, decoder, target_lang, k, is_final)
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+            if msg.get("text") is not None:
+                data = json.loads(msg["text"])
+                typ = data.get("type")
+                if typ == "start":
+                    asr = StreamingASR(language=_whisper_lang(data.get("source_lang")))
+                    decoder = StreamingDecoder()
+                    target_lang = LANG_MAP.get(data.get("target_lang", "en"), "English")
+                    k = max(1, int(data.get("k", 3)))
+                    pending = 0
+                    last_fed = 0
+                    recording = True
+                    await ws.send_json({"type": "status", "msg": "listening"})
+                elif typ == "config":
+                    if "target_lang" in data:
+                        target_lang = LANG_MAP.get(data["target_lang"], "English")
+                    if "source_lang" in data:
+                        asr.language = _whisper_lang(data["source_lang"])
+                    if "k" in data:
+                        k = max(1, int(data["k"]))
+                elif typ == "stop":
+                    recording = False
+                    if len(asr.audio) > 0 or asr.committed:
+                        text, lang, translation = await run(True)
+                        await ws.send_json({"type": "final", "transcript": text,
+                                            "lang": lang, "translation": translation})
+                    else:
+                        await ws.send_json({"type": "final", "transcript": "",
+                                            "lang": None, "translation": ""})
+
+            elif msg.get("bytes") is not None:
+                if not recording:
+                    continue
+                asr.add_audio(msg["bytes"])
+                pending += len(msg["bytes"])
+                if pending >= RETRANSCRIBE_BYTES:
+                    pending = 0
+                    text, lang, translation = await run(False)
+                    out = {"type": "partial", "transcript": text, "lang": lang}
+                    if translation is not None:   # None → keep last shown output
+                        out["translation"] = translation
+                    await ws.send_json(out)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001 — report, don't kill the server
+        import traceback
+        traceback.print_exc()
+        try:
+            await ws.send_json({"type": "error", "msg": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--base", default="sarvamai/sarvam-translate")
@@ -339,14 +838,46 @@ def parse_args():
                    help="Force 4-bit quantization (for GPUs with < 8 GB VRAM)")
     p.add_argument("--no-quantize", action="store_true", default=False,
                    help="Force full precision (needs 8 GB+ VRAM)")
+    p.add_argument("--whisper-model", default="base",
+                   help="faster-whisper model for live speech ASR "
+                        "(tiny/base/small/medium; multilingual). 'base' is the "
+                        "snappy default; 'small' is more accurate for Indian "
+                        "languages but slower (fine on GPU).")
+    p.add_argument("--whisper-compute", default="int8",
+                   help="faster-whisper compute type (int8 / float16 / float32). "
+                        "Ignored when --whisper-device=auto picks the GPU.")
+    p.add_argument("--whisper-device", default="auto",
+                   help="auto | cpu | cuda. 'auto' uses the GPU when the remote "
+                        "LLM has freed it, otherwise CPU.")
+    p.add_argument("--no-asr", action="store_true", default=False,
+                   help="Skip loading the ASR model (typed demo only)")
+    # ---- Remote translation backend (primary) ----
+    p.add_argument("--backend", choices=["auto", "remote", "local"],
+                   default=os.environ.get("TRANSLATE_BACKEND", "auto"),
+                   help="auto: use the remote LLM if reachable else local; "
+                        "remote: force remote (local only as runtime fallback); "
+                        "local: the original on-device 4B model.")
+    p.add_argument("--api-url",
+                   default=os.environ.get("TRANSLATE_API_URL",
+                                          "http://64.247.196.173:8080/v1"),
+                   help="Base URL of the OpenAI-compatible translation LLM.")
+    p.add_argument("--api-key", default=os.environ.get("TRANSLATE_API_KEY", "EMPTY"))
+    p.add_argument("--api-model", default=os.environ.get("TRANSLATE_API_MODEL"),
+                   help="Model id to request (default: auto-discover via /v1/models).")
     return p.parse_args()
 
 
 def main():
-    global MODEL, TOKENIZER, DEVICE
+    global MODEL, TOKENIZER, DEVICE, WHISPER_MODEL, WHISPER_COMPUTE, WHISPER_DEVICE
+    global TRANSLATE_BACKEND, API_URL, API_KEY, API_MODEL, USE_REMOTE, REMOTE_OK
+    global _LOCAL_ARGS
     args = parse_args()
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    TRANSLATE_BACKEND = args.backend
+    API_URL = args.api_url.rstrip("/")
+    API_KEY = args.api_key
+    API_MODEL = args.api_model
 
     # Auto-detect quantization need based on available VRAM
     if args.no_quantize:
@@ -360,15 +891,58 @@ def main():
               f"{'4-bit quantization' if use_4bit else 'full precision'}")
     else:
         use_4bit = False
+    # Remember how to load the local model so it can be a lazy fallback later.
+    _LOCAL_ARGS = {"base": args.base, "adapter": args.adapter, "use_4bit": use_4bit}
 
-    print(f"[server] Loading model on {DEVICE} (4-bit={use_4bit})...")
-    # eager is the safe, proven config for this model; the main speedup is the
-    # incremental /step decoding plus loading in bf16 (see load.py).
-    MODEL, TOKENIZER = load_model(
-        args.base, args.adapter, device=DEVICE, quantize_4bit=use_4bit,
-        attn_implementation="eager",
-    )
-    print(f"[server] Model loaded. Starting server on {args.host}:{args.port}")
+    # ---- Choose the translation engine ----
+    if TRANSLATE_BACKEND in ("auto", "remote"):
+        print(f"[server] Probing remote LLM at {API_URL} ...")
+        REMOTE_OK = _probe_remote()
+        if REMOTE_OK:
+            USE_REMOTE = True
+            print(f"[server] Using REMOTE LLM (model={API_MODEL or 'default'}). "
+                  f"Local 4B NOT loaded → GPU free for fast ASR.")
+        elif TRANSLATE_BACKEND == "remote":
+            USE_REMOTE = True   # forced; load local lazily only if a request fails
+            print("[server] Remote forced but probe failed; will retry per request "
+                  "and fall back to the local model on demand.")
+        else:
+            print("[server] Remote unreachable → falling back to the LOCAL model.")
+
+    if not USE_REMOTE:
+        print(f"[server] Loading local model on {DEVICE} (4-bit={use_4bit})...")
+        # eager is the safe, proven config for this model.
+        MODEL, TOKENIZER = load_model(
+            args.base, args.adapter, device=DEVICE, quantize_4bit=use_4bit,
+            attn_implementation="eager",
+        )
+        print("[server] Local model loaded.")
+
+    # ---- faster-whisper device ----
+    # Prefer the GPU whenever CUDA exists. In remote mode the GPU is idle, so we
+    # use float16 (fastest). In local mode the 4B model is resident, so we use the
+    # memory-light int8_float16 — it still fits in the ~2 GB the 4B model leaves
+    # free and is ~10× faster than CPU (which was the old, "extremely slow" path).
+    # _get_whisper() falls back to CPU automatically if the GPU load OOMs.
+    WHISPER_MODEL = args.whisper_model
+    if args.whisper_device == "auto":
+        if torch.cuda.is_available():
+            WHISPER_DEVICE = "cuda"
+            WHISPER_COMPUTE = "float16" if USE_REMOTE else "int8_float16"
+        else:
+            WHISPER_DEVICE, WHISPER_COMPUTE = "cpu", "int8"
+    else:
+        WHISPER_DEVICE, WHISPER_COMPUTE = args.whisper_device, args.whisper_compute
+
+    if not args.no_asr:
+        try:
+            _get_whisper()                # preload so the first utterance is instant
+            print(f"[server] ASR ready (faster-whisper '{WHISPER_MODEL}' on "
+                  f"{WHISPER_DEVICE}/{WHISPER_COMPUTE}). Live speech enabled.")
+        except Exception as exc:  # noqa: BLE001 — typed demo still works without ASR
+            print(f"[server] WARNING: ASR unavailable ({type(exc).__name__}: {exc}).")
+            print("[server] Install it with: pip install faster-whisper")
+
     print(f"[server] Open http://localhost:{args.port} in your browser")
 
     import uvicorn

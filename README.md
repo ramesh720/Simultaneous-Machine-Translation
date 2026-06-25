@@ -186,10 +186,15 @@ python inference.py --text "..." --policy full
 
 ## Interactive frontend demo
 
-A FastAPI backend serves a browser UI at `http://localhost:8080`. Type a sentence and the wait-k translation appears token by token. After you stop typing, a "Check full sentence" button shows COMET / AL / LAAL comparing the simultaneous output against offline translation.
+A FastAPI backend serves a single, minimal browser UI at `http://localhost:8080`. One surface, two input modes that drive the same wait-k translation:
+
+- **Type** — the translation streams out token by token as each word settles.
+- **Speak** — click the mic in the source field and your speech is transcribed live (spoken language auto-detected); the translation streams under the same policy.
+
+The ASR/MT split keeps a 6 GB GPU happy — **faster-whisper runs on the CPU** while the 4B MT model keeps the GPU. There are no quality metrics in the UI by design (no reference translations at demo time).
 
 ```bash
-# base model (auto 4-bit on 6 GB GPU)
+# base model (auto 4-bit on 6 GB GPU; ASR auto-loads on CPU)
 python frontend/server.py
 
 # with a fine-tuned adapter
@@ -198,14 +203,22 @@ python frontend/server.py --adapter waitk_finetune/checkpoints_multilang/final
 # force 4-bit or full precision
 python frontend/server.py --quantize-4bit
 python frontend/server.py --no-quantize
+
+# pick the speech ASR model: 'base' = snappier, 'small' = better for Indian
+# languages (default). Or disable ASR entirely (typed demo only).
+python frontend/server.py --whisper-model base
+python frontend/server.py --no-asr
 ```
+
+The mic needs `faster-whisper` and `websockets` (in `requirements.txt`). Browsers only grant microphone access on `http://localhost` or HTTPS, so open the demo via `localhost` (use `docker run -p 8080:8080`), not a remote IP.
 
 API endpoints:
 - `GET /` — demo UI
 - `GET /api/languages` — supported languages and directions
 - `GET /api/examples` — example sentences per language
 - `POST /api/translate/step` — stateless incremental wait-k step (one call per word typed)
-- `POST /api/translate/quality` — full-sentence translation + COMET / AL / LAAL
+- `WS /api/asr` — live mic PCM → faster-whisper (CPU, auto-detect) → wait-k translation
+- `POST /api/translate/quality` — full-sentence translation + COMET / AL / LAAL (kept for offline analysis; not surfaced in the UI)
 
 ---
 

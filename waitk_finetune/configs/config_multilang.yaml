@@ -1,0 +1,77 @@
+# =====================================================================
+# Multi-language Wait-k fine-tuning config with SimulMask
+# Trains on Telugu, Hindi, Gujarati, Tamil <-> English (8 directions)
+# Optimized for single L4 GPU (24 GB VRAM)
+#
+# Usage:
+#   python train.py --config configs/config_multilang.yaml
+#   python train.py --config configs/config_multilang.yaml waitk.k=5
+# =====================================================================
+
+seed: 42
+
+model:
+  name: sarvamai/sarvam-translate
+  dtype: bfloat16
+  gradient_checkpointing: true
+  attn_implementation: eager
+
+lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  tsv_path: ../multilang_train.tsv
+  source_column: src
+  target_column: tgt
+  target_language: auto           # Read from tgt_lang column in TSV
+  target_language_column: tgt_lang  # Column name for per-row target language
+  val_fraction: 0.02
+  max_length: 512
+  num_workers: 4
+
+waitk:
+  k: 3
+  full_sentence_prob: 0.3
+
+simulmask:
+  enabled: true                    # Use SimulMask instead of prefix truncation
+
+training:
+  lr: 1.0e-4
+  weight_decay: 0.0
+  batch_size: 4
+  grad_accum: 4                    # Effective batch size = 16
+  max_epochs: 2                    # 2 epochs for speed
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  precision: bf16-true
+
+trainer:
+  devices: 1                       # Single L4 GPU
+  strategy: auto
+  accelerator: gpu
+  log_every_n_steps: 50
+  val_check_interval: 0.5
+
+checkpoint:
+  dirpath: checkpoints_multilang
+  save_top_k: 2
+  monitor: val/loss
+  mode: min
+
+wandb:
+  enabled: false                   # Disable to save time
+  project: simul-mt-waitk
+  name: null
+  entity: null

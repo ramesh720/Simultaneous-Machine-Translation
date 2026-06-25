@@ -1,7 +1,4 @@
-"""Load a (base or LoRA-fine-tuned) model for evaluation / inference.
-
-Supports 4-bit quantization via bitsandbytes for low-VRAM GPUs (e.g. 6GB).
-"""
+"""Load a (base or LoRA-fine-tuned) model for evaluation / inference."""
 from __future__ import annotations
 
 import torch
@@ -11,12 +8,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def load_model(base_name: str, adapter_path: str | None = None,
                dtype: str = "bfloat16", device: str | None = None,
                quantize_4bit: bool = False):
-    """Load the model for inference.
-
-    Args:
-        quantize_4bit: If True, load in 4-bit via bitsandbytes (fits in ~3GB VRAM).
-                       Requires: pip install bitsandbytes
-    """
     device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     torch_dtype = getattr(torch, dtype)
 
@@ -26,36 +17,36 @@ def load_model(base_name: str, adapter_path: str | None = None,
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    if quantize_4bit:
+    if quantize_4bit and "cuda" in device:
         from transformers import BitsAndBytesConfig
-
-        bnb_config = BitsAndBytesConfig(
+        q_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch_dtype,
+            bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
         )
+        print(f"[load] Loading '{base_name}' in 4-bit quantization...")
         model = AutoModelForCausalLM.from_pretrained(
             base_name,
-            quantization_config=bnb_config,
+            quantization_config=q_cfg,
             device_map="auto",
             attn_implementation="eager",
         )
     else:
+        print(f"[load] Loading '{base_name}' in {dtype} precision...")
         model = AutoModelForCausalLM.from_pretrained(
-            base_name, dtype=torch_dtype, attn_implementation="eager"
+            base_name, torch_dtype=torch_dtype, attn_implementation="eager"
         )
+        model.to(device)
 
     if adapter_path:
         from peft import PeftModel
-
+        print(f"[load] Loading adapter from '{adapter_path}'...")
         model = PeftModel.from_pretrained(model, adapter_path)
         if not quantize_4bit:
             model = model.merge_and_unload()   # fold LoRA into base for fast inference
 
     model.config.use_cache = True
-    if not quantize_4bit:
-        model.to(device)
     model.eval()
     return model, tokenizer
 

@@ -38,8 +38,9 @@ from accelerate.utils import gather_object
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "waitk_finetune"))
 from src.load import load_model                                          # noqa: E402
-from src.waitk import average_lagging, build_prompt, load_pairs, wait_k_decode  # noqa: E402
+from src.waitk import average_lagging, laal, build_prompt, load_pairs, wait_k_decode  # noqa: E402
 from src.adaptive import local_agreement_decode, confidence_decode       # noqa: E402
+from src.comet_eval import score_comet  # noqa: E402
 
 LANG_NAME = {"te": "Telugu", "hi": "Hindi", "gu": "Gujarati",
              "ta": "Tamil", "en": "English"}
@@ -122,7 +123,8 @@ def streaming_shard(model, tokenizer, shard, tgt_lang, policy, param, max_new_to
             hyp, trace = confidence_decode(model, tokenizer, src, tau=param,
                                            target_language=tgt_lang,
                                            max_target_tokens=max_new_tokens, verbose=False)
-        out.append((idx, hyp, average_lagging(trace, len(src.split()))))
+        out.append((idx, hyp, average_lagging(trace, len(src.split())),
+                   laal(trace, len(src.split()))))
     return out
 
 
@@ -145,14 +147,27 @@ def evaluate_run(model, tokenizer, state, sources, references, tgt_lang,
         return None, None
 
     gathered.sort(key=lambda r: r[0])
-    hyps = [h for _, h, _ in gathered]
-    als = [a for _, _, a in gathered if a is not None]
+    hyps = [h for _, h, *_ in gathered]
+    als = [r[2] for r in gathered if r[2] is not None]
+    laals = [r[3] for r in gathered if len(r) > 3 and r[3] is not None]
     bleu = sacrebleu.corpus_bleu(hyps, [references], tokenize=args.tokenize).score
     mean_al = (sum(als) / len(als)) if als else None
+    mean_laal = (sum(laals) / len(laals)) if laals else None
+
+    # COMET scoring (on main process only)
+    comet_score = None
+    try:
+        comet_result = score_comet(sources, hyps, references, gpus=1)
+        if comet_result:
+            comet_score = comet_result["system_score"]
+    except Exception as e:
+        print(f"  [comet] skipped: {e}")
 
     records = [{"input": sources[i], "reference": references[i], "hypothesis": h,
-                "AL": a} for (i, h, a) in gathered]
-    row = {"policy": policy, "param": param, "bleu": bleu, "AL": mean_al, "n": len(hyps)}
+                "AL": r[2], "LAAL": r[3] if len(r) > 3 else None}
+               for (r, h) in zip(gathered, hyps)]
+    row = {"policy": policy, "param": param, "bleu": bleu, "comet": comet_score,
+           "AL": mean_al, "LAAL": mean_laal, "n": len(hyps)}
     return row, records
 
 

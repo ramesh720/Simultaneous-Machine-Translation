@@ -3,12 +3,8 @@
 Serves translation requests (full-sentence and streaming wait-k) and
 pre-computed evaluation metrics. Runs on port 8080.
 
-Supports 4-bit quantization for low-VRAM GPUs (RTX 3060 6GB etc.).
-
 Usage:
-    python server.py                          # Auto-detect: 4-bit if VRAM < 8GB
-    python server.py --quantize-4bit          # Force 4-bit quantization
-    python server.py --no-quantize            # Force full precision (needs 8GB+ VRAM)
+    python server.py
     python server.py --adapter checkpoints_multilang/final --port 8080
 """
 from __future__ import annotations
@@ -16,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -103,8 +100,9 @@ async def translate(request: Request):
     if not text:
         return JSONResponse({"error": "No text provided"}, status_code=400)
 
+    model_device = next(MODEL.parameters()).device
     prompt = build_prompt(TOKENIZER, text, tgt_lang)
-    enc = TOKENIZER(prompt, return_tensors="pt").to(MODEL.device)
+    enc = TOKENIZER(prompt, return_tensors="pt").to(model_device)
 
     with torch.inference_mode():
         gen = MODEL.generate(
@@ -120,13 +118,11 @@ async def translate(request: Request):
     return {"translation": translation, "policy": "full", "target_language": tgt_lang}
 
 
-@app.post("/api/translate/stream")
-async def translate_stream(request: Request):
+@app.get("/api/translate/stream")
+async def translate_stream(text: str, target_lang: str = "en", k: int = 3):
     """SSE-streamed wait-k translation with READ/WRITE events."""
-    body = await request.json()
-    text = body.get("text", "").strip()
-    tgt_lang = LANG_MAP.get(body.get("target_lang", "en"), "English")
-    k = body.get("k", 3)
+    text = text.strip()
+    tgt_lang = LANG_MAP.get(target_lang, "English")
 
     if not text:
         return JSONResponse({"error": "No text provided"}, status_code=400)
@@ -137,6 +133,7 @@ async def translate_stream(request: Request):
         S = len(src_words)
         committed = []
         prev_read = 0
+        model_device = next(MODEL.parameters()).device
 
         for t in range(1, 257):
             num_src = min(k + t - 1, S)
@@ -159,10 +156,10 @@ async def translate_stream(request: Request):
             prompt = build_prompt(
                 TOKENIZER, " ".join(src_words[:num_src]), tgt_lang
             )
-            prompt_ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(MODEL.device)
+            prompt_ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(model_device)
             if committed:
                 tail = torch.tensor(
-                    [committed], device=MODEL.device, dtype=prompt_ids.dtype
+                    [committed], device=model_device, dtype=prompt_ids.dtype
                 )
                 input_ids = torch.cat([prompt_ids, tail], dim=1)
             else:
@@ -211,6 +208,50 @@ async def translate_stream(request: Request):
     return EventSourceResponse(event_generator())
 
 
+@app.post("/api/translate/compare")
+async def compare(request: Request):
+    """Side-by-side comparison: full-sentence vs wait-k with latency metrics."""
+    import math
+    body = await request.json()
+    text = body.get("text", "").strip()
+    tgt_lang_code = body.get("target_lang", "en")
+    tgt_lang = LANG_MAP.get(tgt_lang_code, "English")
+    k = body.get("k", 3)
+
+    if not text:
+        return JSONResponse({"error": "No text provided"}, status_code=400)
+
+    # 1. Full-sentence (offline) translation
+    model_device = next(MODEL.parameters()).device
+    prompt = build_prompt(TOKENIZER, text, tgt_lang)
+    enc = TOKENIZER(prompt, return_tensors="pt").to(model_device)
+    with torch.inference_mode():
+        gen = MODEL.generate(
+            **enc, max_new_tokens=256, do_sample=False,
+            num_beams=1, pad_token_id=TOKENIZER.pad_token_id,
+        )
+    out = TOKENIZER.decode(gen[0, enc.input_ids.shape[1]:], skip_special_tokens=True)
+    full_translation = out.split("<end_of_turn>")[0].strip()
+
+    # 2. Wait-K (simultaneous) translation
+    waitk_translation, trace = wait_k_decode(
+        MODEL, TOKENIZER, text, k=k, target_language=tgt_lang, max_target_tokens=256
+    )
+
+    # 3. Compute latency metrics
+    num_src_words = len(text.split())
+    al_score = average_lagging(trace, num_src_words)
+    laal_score = laal(trace, num_src_words)
+    al_val = None if math.isnan(al_score) else round(al_score, 2)
+    laal_val = None if math.isnan(laal_score) else round(laal_score, 2)
+
+    return {
+        "full_translation": full_translation,
+        "waitk_translation": waitk_translation,
+        "metrics": {"al": al_val, "laal": laal_val, "src_words": num_src_words, "k": k},
+    }
+
+
 @app.get("/api/metrics")
 async def metrics():
     """Return pre-computed evaluation metrics from metrics_summary.json."""
@@ -227,7 +268,7 @@ async def metrics():
     return {
         "base": "sarvamai/sarvam-translate",
         "adapter": None,
-        "note": "No evaluation results found yet.",
+        "note": "No evaluation results found. Run run_full_pipeline.sh first.",
         "results": [],
     }
 
@@ -273,9 +314,9 @@ def parse_args():
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--quantize-4bit", action="store_true", default=False,
-                   help="Force 4-bit quantization (for GPUs with < 8GB VRAM)")
+                   help="Force 4-bit quantization (for GPUs with < 8 GB VRAM)")
     p.add_argument("--no-quantize", action="store_true", default=False,
-                   help="Force full precision (needs 8GB+ VRAM)")
+                   help="Force full precision (needs 8 GB+ VRAM)")
     return p.parse_args()
 
 
@@ -285,15 +326,16 @@ def main():
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Auto-detect quantization need based on VRAM
+    # Auto-detect quantization need based on available VRAM
     if args.no_quantize:
         use_4bit = False
     elif args.quantize_4bit:
         use_4bit = True
     elif DEVICE == "cuda":
-        vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         use_4bit = vram_gb < 8.0
-        print(f"[server] VRAM: {vram_gb:.1f} GB — {'using 4-bit quantization' if use_4bit else 'using full precision'}")
+        print(f"[server] Detected {vram_gb:.1f} GB VRAM → "
+              f"{'4-bit quantization' if use_4bit else 'full precision'}")
     else:
         use_4bit = False
 

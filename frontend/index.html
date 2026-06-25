@@ -1,216 +1,244 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SimulMT — Simultaneous Machine Translation</title>
-    <meta name="description"
-        content="Interactive demonstration of Simultaneous Machine Translation using Wait-K policy for Telugu, Hindi, Gujarati, and Tamil.">
+    <meta name="description" content="Interactive demonstration of Simultaneous Machine Translation using Wait-K policy with SimulMask attention masking for Telugu, Hindi, Gujarati, and Tamil.">
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
-
 <body>
 
-    <!-- ===== HERO ===== -->
-    <section class="hero">
-        <div class="container">
-            <div class="hero-badge">
-                <span class="dot"></span>
-                Wait-K Simultaneous Translation
+<!-- ===== HERO ===== -->
+<section class="hero">
+    <div class="container">
+        <div class="hero-badge">
+            <span class="dot"></span>
+            SimulMask + Wait-K Policy
+        </div>
+        <h1>
+            <span class="gradient-text">Simultaneous</span><br>
+            Machine Translation
+        </h1>
+        <p>
+            Real-time translation for Indian languages using Wait-K decoding with
+            SimulMask attention masking — translating before the speaker finishes.
+        </p>
+        <div class="hero-stats">
+            <div class="hero-stat">
+                <div class="value">4</div>
+                <div class="label">Languages</div>
             </div>
-            <h1>
-                <span class="gradient-text">Simultaneous</span><br>
-                Machine Translation
-            </h1>
-            <p>
-                Real-time translation for Indian languages using Wait-K decoding —
-                translating before the speaker finishes.
-            </p>
-            <div class="hero-stats">
-                <div class="hero-stat">
-                    <div class="value">4</div>
-                    <div class="label">Languages</div>
-                </div>
-                <div class="hero-stat">
-                    <div class="value">8</div>
-                    <div class="label">Directions</div>
-                </div>
-                <div class="hero-stat">
-                    <div class="value">Wait-K</div>
-                    <div class="label">Policy</div>
-                </div>
-                <div class="hero-stat">
-                    <div class="value">Live</div>
-                    <div class="label">Demo</div>
-                </div>
+            <div class="hero-stat">
+                <div class="value">8</div>
+                <div class="label">Directions</div>
+            </div>
+            <div class="hero-stat">
+                <div class="value">SimulMask</div>
+                <div class="label">Training Method</div>
+            </div>
+            <div class="hero-stat">
+                <div class="value">COMET</div>
+                <div class="label">Neural Metric</div>
             </div>
         </div>
-    </section>
+    </div>
+</section>
 
-    <!-- ===== PIPELINE DIAGRAM ===== -->
-    <section id="pipeline-section">
-        <div class="container">
-            <h2 class="section-title">Translation Pipeline</h2>
-            <p class="section-subtitle">How simultaneous translation works at the machine translation level</p>
-            <div class="pipeline" id="pipeline">
-                <div class="pipeline-step" id="pipe-source">
-                    <span class="icon">📝</span>
-                    <span class="step-name">Source Text</span>
-                </div>
-                <span class="pipeline-arrow">→</span>
-                <div class="pipeline-step" id="pipe-read">
-                    <span class="icon">👁️</span>
-                    <span class="step-name">READ Words</span>
-                </div>
-                <span class="pipeline-arrow">→</span>
-                <div class="pipeline-step" id="pipe-policy">
-                    <span class="icon">⚡</span>
-                    <span class="step-name">Wait-K Policy</span>
-                </div>
-                <span class="pipeline-arrow">→</span>
-                <div class="pipeline-step" id="pipe-write">
-                    <span class="icon">✍️</span>
-                    <span class="step-name">WRITE Tokens</span>
-                </div>
-                <span class="pipeline-arrow">→</span>
-                <div class="pipeline-step" id="pipe-target">
-                    <span class="icon">🌍</span>
-                    <span class="step-name">Translation</span>
-                </div>
+<!-- ===== PIPELINE DIAGRAM ===== -->
+<section id="pipeline-section">
+    <div class="container">
+        <h2 class="section-title">Translation Pipeline</h2>
+        <p class="section-subtitle">How simultaneous translation works at the machine translation level</p>
+        <div class="pipeline" id="pipeline">
+            <div class="pipeline-step" id="pipe-source">
+                <span class="icon">📝</span>
+                <span class="step-name">Source Text</span>
+            </div>
+            <span class="pipeline-arrow">→</span>
+            <div class="pipeline-step" id="pipe-read">
+                <span class="icon">👁️</span>
+                <span class="step-name">READ Words</span>
+            </div>
+            <span class="pipeline-arrow">→</span>
+            <div class="pipeline-step" id="pipe-mask">
+                <span class="icon">🎭</span>
+                <span class="step-name">SimulMask</span>
+            </div>
+            <span class="pipeline-arrow">→</span>
+            <div class="pipeline-step" id="pipe-policy">
+                <span class="icon">⚡</span>
+                <span class="step-name">Wait-K Policy</span>
+            </div>
+            <span class="pipeline-arrow">→</span>
+            <div class="pipeline-step" id="pipe-write">
+                <span class="icon">✍️</span>
+                <span class="step-name">WRITE Tokens</span>
+            </div>
+            <span class="pipeline-arrow">→</span>
+            <div class="pipeline-step" id="pipe-target">
+                <span class="icon">🌍</span>
+                <span class="step-name">Translation</span>
             </div>
         </div>
-    </section>
+    </div>
+</section>
 
-    <!-- ===== LIVE DEMO ===== -->
-    <section id="demo-section">
-        <div class="container">
-            <h2 class="section-title">Live Translation Demo</h2>
-            <p class="section-subtitle">Watch simultaneous translation happen word-by-word in real time</p>
+<!-- ===== LIVE DEMO ===== -->
+<section id="demo-section">
+    <div class="container">
+        <h2 class="section-title">Live Translation Demo</h2>
+        <p class="section-subtitle">Watch simultaneous translation happen word-by-word in real time</p>
 
-            <div class="card">
-                <!-- Language Selection -->
-                <div class="direction-toggle">
-                    <span class="direction-label">Source</span>
-                    <div class="lang-selector" id="src-lang-selector"></div>
-                    <span class="arrow" id="swap-direction" title="Swap direction">⇄</span>
-                    <span class="direction-label">Target</span>
-                    <div class="lang-selector" id="tgt-lang-selector"></div>
-                </div>
-
-                <!-- K Selector -->
-                <div class="k-selector">
-                    <label for="k-slider">Wait-K value:</label>
-                    <input type="range" id="k-slider" min="1" max="9" value="3" step="2">
-                    <span class="k-value" id="k-display">k=3</span>
-                </div>
-
-                <!-- Example Sentences -->
-                <div class="examples-bar" id="examples-bar"></div>
-
-                <!-- Input/Output -->
-                <div class="translation-grid">
-                    <div class="input-area">
-                        <span class="area-label" id="input-label">Source (Telugu)</span>
-                        <textarea id="source-input" placeholder="Type or paste text here..."></textarea>
-                    </div>
-                    <div class="output-area">
-                        <span class="area-label" id="output-label">Translation (English)</span>
-                        <div class="output-box" id="translation-output">
-                            <span class="placeholder-text" style="color: var(--text-muted)">Translation will appear
-                                here...</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Action Buttons -->
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="btn-translate-stream" onclick="translateStream()">
-                        ⚡ Simultaneous (Wait-K)
-                    </button>
-                    <button class="btn btn-secondary" id="btn-translate-full" onclick="translateFull()">
-                        📄 Full Sentence
-                    </button>
-                    <button class="btn btn-secondary" id="btn-clear" onclick="clearAll()">
-                        ✕ Clear
-                    </button>
-                </div>
-
-                <!-- Status -->
-                <div class="status-bar" id="status-bar">
-                    <span class="status-dot"></span>
-                    <span id="status-text">Ready</span>
-                </div>
-
-                <!-- Trace Panel -->
-                <div class="trace-panel">
-                    <div class="trace-header">
-                        <span class="trace-title">READ / WRITE Trace</span>
-                        <span id="trace-stats" style="font-size: 0.8rem; color: var(--text-muted)"></span>
-                    </div>
-                    <div class="trace-container" id="trace-container">
-                        <div style="color: var(--text-muted); font-style: italic;">
-                            Trace will appear here when you run a Wait-K translation...
-                        </div>
-                    </div>
-                </div>
+        <div class="card">
+            <!-- Language Selection -->
+            <div class="direction-toggle">
+                <span class="direction-label" id="src-lang-label">Source</span>
+                <div class="lang-selector" id="src-lang-selector"></div>
+                <span class="arrow" id="swap-direction" title="Swap direction">⇄</span>
+                <span class="direction-label" id="tgt-lang-label">Target</span>
+                <div class="lang-selector" id="tgt-lang-selector"></div>
             </div>
-        </div>
-    </section>
 
-    <!-- ===== COMPARISON ===== -->
-    <section id="comparison-section">
-        <div class="container">
-            <h2 class="section-title">Policy Comparison</h2>
-            <p class="section-subtitle">Full-sentence (offline) vs Wait-K (simultaneous) — quality vs latency</p>
+            <!-- K Selector -->
+            <div class="k-selector">
+                <label for="k-slider">Wait-K value:</label>
+                <input type="range" id="k-slider" min="1" max="9" value="3" step="2">
+                <span class="k-value" id="k-display">k=3</span>
+            </div>
 
-            <div class="comparison-grid">
-                <div class="card comparison-card offline">
-                    <span class="card-badge">Offline</span>
-                    <h3 style="margin-top: 8px; margin-bottom: 8px;">Full Sentence</h3>
-                    <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
-                        Reads entire source → produces complete translation. Maximum quality, maximum latency.
-                    </p>
-                    <div class="output-box" id="comparison-full" style="min-height: 100px;">
-                        <span style="color: var(--text-muted)">Run comparison to see results...</span>
-                    </div>
+            <!-- Example Sentences -->
+            <div class="examples-bar" id="examples-bar"></div>
+
+            <!-- Input/Output -->
+            <div class="translation-grid">
+                <div class="input-area">
+                    <span class="area-label" id="input-label">Source (Telugu)</span>
+                    <textarea id="source-input" placeholder="Type or paste text here..."></textarea>
                 </div>
-
-                <div class="card comparison-card simultaneous">
-                    <span class="card-badge">Simultaneous</span>
-                    <h3 style="margin-top: 8px; margin-bottom: 8px;">Wait-K</h3>
-                    <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
-                        Starts translating after reading K words. Lower latency, near-offline quality.
-                    </p>
-                    <div class="output-box" id="comparison-waitk" style="min-height: 100px;">
-                        <span style="color: var(--text-muted)">Run comparison to see results...</span>
+                <div class="output-area">
+                    <span class="area-label" id="output-label">Translation (English)</span>
+                    <div class="output-box" id="translation-output">
+                        <span class="placeholder-text" style="color: var(--text-muted)">Translation will appear here...</span>
                     </div>
                 </div>
             </div>
 
-            <div style="text-align: center; margin-top: 24px;">
-                <button class="btn btn-primary" id="btn-compare" onclick="runComparison()">
-                    🔄 Run Comparison
+            <!-- Action Buttons -->
+            <div class="btn-group">
+                <button class="btn btn-primary" id="btn-translate-stream" onclick="translateStream()">
+                    ⚡ Simultaneous (Wait-K)
+                </button>
+                <button class="btn btn-secondary" id="btn-translate-full" onclick="translateFull()">
+                    📄 Full Sentence
+                </button>
+                <button class="btn btn-secondary" id="btn-clear" onclick="clearAll()">
+                    ✕ Clear
                 </button>
             </div>
-        </div>
-    </section>
 
-    <!-- ===== FOOTER ===== -->
-    <footer class="footer">
-        <div class="container">
-            <p>
-                Simultaneous Machine Translation — Wait-K Policy<br>
-                <a href="https://github.com/chiranjeevi-sagi/Simultaneous-Machine-Translation" target="_blank">
-                    GitHub Repository
-                </a>
-                · Built with sarvam-translate (Gemma3-4B)
-            </p>
-        </div>
-    </footer>
+            <!-- Status -->
+            <div class="status-bar" id="status-bar">
+                <span class="status-dot"></span>
+                <span id="status-text">Ready</span>
+            </div>
 
-    <script src="/static/app.js"></script>
+            <!-- Trace Panel -->
+            <div class="trace-panel">
+                <div class="trace-header">
+                    <span class="trace-title">READ / WRITE Trace</span>
+                    <span id="trace-stats" style="font-size: 0.8rem; color: var(--text-muted)"></span>
+                </div>
+                <div class="trace-container" id="trace-container">
+                    <div style="color: var(--text-muted); font-style: italic;">
+                        Trace will appear here when you run a Wait-K translation...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ===== COMPARISON ===== -->
+<section id="comparison-section">
+    <div class="container">
+        <h2 class="section-title">Policy Comparison</h2>
+        <p class="section-subtitle">Full-sentence (offline) vs Wait-K (simultaneous) — quality vs latency</p>
+
+        <div class="comparison-grid">
+            <div class="card comparison-card offline">
+                <span class="card-badge">Offline</span>
+                <h3 style="margin-top: 8px; margin-bottom: 8px;">Full Sentence</h3>
+                <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
+                    Reads entire source → produces complete translation. Maximum quality, maximum latency.
+                </p>
+                <div class="output-box" id="comparison-full" style="min-height: 100px;">
+                    <span style="color: var(--text-muted)">Run comparison to see results...</span>
+                </div>
+                <div class="status-bar" id="comparison-full-status" style="margin-top: 8px;">
+                    <span class="status-dot"></span>
+                    <span>Waiting</span>
+                </div>
+            </div>
+
+            <div class="card comparison-card simultaneous">
+                <span class="card-badge">Simultaneous</span>
+                <h3 style="margin-top: 8px; margin-bottom: 8px;">Wait-K</h3>
+                <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
+                    Starts translating after reading K words. Lower latency, near-offline quality.
+                </p>
+                <div class="output-box" id="comparison-waitk" style="min-height: 100px;">
+                    <span style="color: var(--text-muted)">Run comparison to see results...</span>
+                </div>
+                <div class="status-bar" id="comparison-waitk-status" style="margin-top: 8px;">
+                    <span class="status-dot"></span>
+                    <span>Waiting</span>
+                </div>
+            </div>
+        </div>
+
+        <div style="text-align: center; margin-top: 24px;">
+            <button class="btn btn-primary" id="btn-compare" onclick="runComparison()">
+                🔄 Run Comparison
+            </button>
+        </div>
+    </div>
+</section>
+
+<!-- ===== METRICS DASHBOARD ===== -->
+<section id="metrics-section">
+    <div class="container">
+        <h2 class="section-title">Evaluation Metrics</h2>
+        <p class="section-subtitle">BLEU, COMET, Average Lagging (AL), and Length-Adaptive AL (LAAL) across languages</p>
+
+        <div class="metrics-grid" id="metrics-summary"></div>
+
+        <div class="chart-container">
+            <h3 style="margin-bottom: 16px; font-size: 1.1rem;">Quality vs Latency Frontier</h3>
+            <canvas id="bleu-al-chart"></canvas>
+        </div>
+
+        <div class="chart-container">
+            <h3 style="margin-bottom: 16px; font-size: 1.1rem;">BLEU by Language & Policy</h3>
+            <canvas id="bleu-lang-chart"></canvas>
+        </div>
+    </div>
+</section>
+
+<!-- ===== FOOTER ===== -->
+<footer class="footer">
+    <div class="container">
+        <p>
+            Simultaneous Machine Translation — Wait-K + SimulMask + COMET + LAAL<br>
+            <a href="https://github.com/chiranjeevi-sagi/Simultaneous-Machine-Translation" target="_blank">
+                GitHub Repository
+            </a>
+            · Built with sarvam-translate (Gemma3-4B)
+        </p>
+    </div>
+</footer>
+
+<script src="/static/app.js"></script>
 </body>
-
 </html>

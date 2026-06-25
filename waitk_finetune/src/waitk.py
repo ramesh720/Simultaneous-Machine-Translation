@@ -85,9 +85,10 @@ def wait_k_decode(
             trace.append(("READ", src_words[prev_read - 1]))
 
         prompt = build_prompt(tokenizer, " ".join(src_words[:num_src]), target_language)
-        prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        first_device = next(model.parameters()).device
+        prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(first_device)
         if committed:
-            tail = torch.tensor([committed], device=model.device, dtype=prompt_ids.dtype)
+            tail = torch.tensor([committed], device=first_device, dtype=prompt_ids.dtype)
             input_ids = torch.cat([prompt_ids, tail], dim=1)
         else:
             input_ids = prompt_ids
@@ -148,7 +149,8 @@ def laal(trace, num_src_words: int) -> float:
     """Length-Adaptive Average Lagging — unbiased for over/under-generation.
 
     Standard AL underestimates latency when the system over-generates.
-    LAAL normalises by max(|target|, |source|) instead of tau.
+    LAAL normalises by max(|target|, |source|) instead of tau, ensuring
+    fair comparison across systems with different output lengths.
     """
     src_read, g = 0, []
     for action, _ in trace:
@@ -161,7 +163,7 @@ def laal(trace, num_src_words: int) -> float:
     tgt_len, src_len = len(g), num_src_words
     rate = tgt_len / src_len if src_len > 0 else 1.0
     tau_cutoff = next((i + 1 for i, gv in enumerate(g) if gv >= src_len), tgt_len)
-    denominator = max(tgt_len, src_len)
+    denominator = max(tgt_len, src_len)  # Length-adaptive normalisation
     return sum(g[t] - t / rate for t in range(tau_cutoff)) / denominator
 
 

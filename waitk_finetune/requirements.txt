@@ -10,3 +10,10 @@ omegaconf>=2.3
 sacrebleu>=2.3
 wandb>=0.16
 tqdm
+fire
+unbabel-comet>=2.2
+fastapi>=0.100
+uvicorn>=0.20
+sse-starlette>=1.6
+aiofiles>=23.0
+python-multipart>=0.0.5

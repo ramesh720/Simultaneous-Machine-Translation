@@ -519,12 +519,14 @@ async def examples():
 # slower as you spoke — O(n²) audio overall — and made the server fall behind
 # real time), StreamingASR re-runs Whisper only on the *uncommitted tail* of the
 # audio, capped at MAX_WINDOW_S, and freezes words with LocalAgreement-2. So the
-# per-update cost stays flat no matter how long the utterance is. Each new stable
-# word drives the same translation path as the typed demo, so output appears
-# while you speak. Speed comes from: bounded re-transcription, GPU float16 when
-# the remote LLM frees the GPU, a *pinned* source language (no per-chunk
-# auto-detect), Silero VAD to skip silence, and skipping the remote re-translate
-# when no new stable word has appeared.
+# per-update cost stays flat no matter how long the utterance is. The transcript
+# is pushed the instant each window is decoded; the stable prefix is translated
+# *in the background* with one fast KV-cached generate (so the slow 4B decode
+# never stalls the transcript), and on stop the whole sentence is translated in
+# one pass — so output appears while you speak yet is never cut off. Speed comes
+# from: bounded re-transcription, the GPU (shared by ASR + MT), a *pinned* source
+# language (no per-chunk auto-detect), Silero VAD to skip silence, and translating
+# only when a new stable word has appeared.
 # =============================================================================
 SR = 16_000                                   # browser sends 16 kHz mono
 RETRANSCRIBE_BYTES = int(SR * 2 * 0.8)        # re-run ASR every ~0.8 s of new audio
@@ -665,109 +667,73 @@ class StreamingASR:
         return full, self.lang
 
 
-class StreamingDecoder:
-    """Per-connection incremental wait-k decoder over a *growing* word list.
-
-    Mirrors the typed-demo /step logic and src.waitk semantics: target token
-    ``t`` (1-indexed) is committed only once ``k + t - 1`` source words are
-    available (or the utterance is final). Committed tokens are never revised.
-    """
-
-    def __init__(self):
-        self.committed: list[int] = []
-        self.finished = False
-
-    @property
-    def text(self) -> str:
-        return TOKENIZER.decode(self.committed, skip_special_tokens=True).strip()
-
-    @torch.inference_mode()
-    def feed(self, src_words: list[str], target_language: str, k: int,
-             is_final: bool, max_tokens: int = 256):
-        if self.finished:
-            return
-        device = next(MODEL.parameters()).device
-        eos_ids = stop_token_ids(TOKENIZER)
-        S = len(src_words)
-        while len(self.committed) < max_tokens:
-            t = len(self.committed) + 1
-            needed = k + t - 1
-            if not is_final and S < needed:
-                break                          # wait for more source words (READ)
-            num_src = min(needed, S)
-            if num_src == 0:
-                break
-            prompt = build_prompt(TOKENIZER, " ".join(src_words[:num_src]),
-                                  target_language)
-            ids = TOKENIZER(prompt, return_tensors="pt").input_ids.to(device)
-            if self.committed:
-                tail = torch.tensor([self.committed], device=device, dtype=ids.dtype)
-                ids = torch.cat([ids, tail], dim=1)
-            logits = MODEL(input_ids=ids).logits[0, -1]
-            # Forbid EOS until the utterance is final AND all source is read.
-            if not (is_final and num_src >= S):
-                for eid in eos_ids:
-                    logits[eid] = float("-inf")
-            next_id = int(logits.argmax())
-            if next_id in eos_ids:
-                self.finished = True
-                break
-            self.committed.append(next_id)
-
-
-def _process_local(asr: StreamingASR, decoder: StreamingDecoder,
-                   target_lang: str, k: int, is_final: bool):
-    """Bounded streaming ASR + local token-level wait-k decode.
-
-    Runs in a worker thread so the asyncio event loop keeps draining audio. The
-    last (still-unstable) transcript word is held back so committed tokens aren't
-    built on a word ASR might still revise.
-    """
-    text, lang = asr.transcribe(is_final=is_final)
-    feed_words = _stable_words(text, is_final)
-    decoder.feed(feed_words, target_language=target_lang, k=k, is_final=is_final)
-    return text, lang, decoder.text
-
-
-async def _process_remote(loop, asr: StreamingASR, target_lang: str, k: int,
-                          is_final: bool, last_fed: int):
-    """Bounded streaming ASR (worker thread) + remote prefix re-translation.
-
-    Skips the HTTP translate call during the wait-k READ phase and whenever no
-    new *stable* word has appeared since the last call, so the remote isn't hit
-    on every partial. Returns ``(text, lang, translation_or_None, new_last_fed)``;
-    a ``None`` translation means "leave the displayed output unchanged".
-    """
-    text, lang = await loop.run_in_executor(None, asr.transcribe, is_final)
-    feed = _stable_words(text, is_final)
-    if not is_final and (len(feed) < k or len(feed) <= last_fed):
-        return text, lang, None, last_fed
-    translation = await _translate_full(" ".join(feed), target_lang)
-    return text, lang, translation, len(feed)
+async def _transcribe(loop, asr: StreamingASR, is_final: bool):
+    """Run the bounded incremental ASR off the event loop so audio keeps draining
+    while Whisper works. Returns ``(full_text, language)``."""
+    return await loop.run_in_executor(None, asr.transcribe, is_final)
 
 
 @app.websocket("/api/asr")
 async def asr_ws(ws: WebSocket):
+    """Live speech → simultaneous translation.
+
+    Two stages share the GPU and run independently so each stays responsive:
+      • ASR: bounded incremental Whisper, ~instant on GPU. The transcript is
+        pushed the moment each ~0.8 s window is decoded, so words appear in near
+        real time regardless of how slow translation is.
+      • MT: the stable prefix is translated with a single KV-cached ``generate``
+        (the typed path's fast route), in the *background*, so the slow 4B decode
+        never blocks the transcript. At most one translation is in flight, so it
+        can't pile up. On ``stop`` the whole sentence is translated in one pass —
+        the output is always the complete sentence, never cut off mid-way.
+
+    Source language is pinned (no per-chunk auto-detect). Changing it restarts the
+    listener in the newly selected language.
+    """
     await ws.accept()
     loop = asyncio.get_event_loop()
 
-    asr = StreamingASR()        # bounded incremental ASR for this connection
-    decoder = StreamingDecoder()
-    target_lang = "English"
+    asr = StreamingASR()            # bounded incremental ASR for this connection
+    target_lang = "Telugu"          # default direction is English → Telugu
     k = 3
     recording = False
-    pending = 0                 # bytes of new audio since the last transcription
-    last_fed = 0                # stable words already sent to the remote translator
+    pending = 0                     # bytes of new audio since the last transcription
+    last_fed = 0                    # stable words already translated
+    xl_task: "asyncio.Task | None" = None    # at most one in-flight translation
 
-    async def run(is_final):
-        """One ASR (+translation) update, routed to the live backend."""
+    async def translate_prefix(feed_words, is_final):
+        """Translate the stable prefix and push it to the client."""
         nonlocal last_fed
-        if USE_REMOTE and REMOTE_OK:
-            text, lang, translation, last_fed = await _process_remote(
-                loop, asr, target_lang, k, is_final, last_fed)
-            return text, lang, translation
-        return await loop.run_in_executor(
-            None, _process_local, asr, decoder, target_lang, k, is_final)
+        try:
+            translation = await _translate_full(" ".join(feed_words), target_lang)
+            last_fed = len(feed_words)
+            await ws.send_json({"type": "final" if is_final else "partial",
+                                "translation": translation})
+        except Exception:  # noqa: BLE001 — a dropped partial must not kill the socket
+            pass
+
+    async def tick(is_final):
+        """One ASR update: push the transcript now, translate the prefix after."""
+        nonlocal xl_task
+        text, lang = await _transcribe(loop, asr, is_final)
+        feed = _stable_words(text, is_final)
+
+        if is_final:
+            if xl_task and not xl_task.done():
+                xl_task.cancel()                     # supersede any live partial
+            await ws.send_json({"type": "partial", "transcript": text, "lang": lang})
+            translation = await _translate_full(" ".join(feed), target_lang)
+            await ws.send_json({"type": "final", "transcript": text, "lang": lang,
+                                "translation": translation})
+            return
+
+        # Live: transcript first (cheap) so words appear immediately…
+        await ws.send_json({"type": "partial", "transcript": text, "lang": lang})
+        # …then translate the stable prefix in the background, but only once a new
+        # stable word past the wait-k lag has appeared and nothing is mid-flight —
+        # so the slow 4B decode never queues up or stalls the live transcript.
+        if len(feed) >= k and len(feed) > last_fed and (xl_task is None or xl_task.done()):
+            xl_task = asyncio.create_task(translate_prefix(feed, False))
 
     try:
         while True:
@@ -779,27 +745,31 @@ async def asr_ws(ws: WebSocket):
                 data = json.loads(msg["text"])
                 typ = data.get("type")
                 if typ == "start":
+                    if xl_task and not xl_task.done():
+                        xl_task.cancel()
                     asr = StreamingASR(language=_whisper_lang(data.get("source_lang")))
-                    decoder = StreamingDecoder()
-                    target_lang = LANG_MAP.get(data.get("target_lang", "en"), "English")
+                    target_lang = LANG_MAP.get(data.get("target_lang", "te"), "Telugu")
                     k = max(1, int(data.get("k", 3)))
-                    pending = 0
-                    last_fed = 0
+                    pending = last_fed = 0
+                    xl_task = None
                     recording = True
                     await ws.send_json({"type": "status", "msg": "listening"})
                 elif typ == "config":
                     if "target_lang" in data:
-                        target_lang = LANG_MAP.get(data["target_lang"], "English")
+                        target_lang = LANG_MAP.get(data["target_lang"], target_lang)
                     if "source_lang" in data:
-                        asr.language = _whisper_lang(data["source_lang"])
+                        new_lang = _whisper_lang(data["source_lang"])
+                        if new_lang != asr.language:   # switch ASR to the new language
+                            if xl_task and not xl_task.done():
+                                xl_task.cancel()
+                            asr = StreamingASR(language=new_lang)
+                            pending = last_fed = 0
                     if "k" in data:
                         k = max(1, int(data["k"]))
                 elif typ == "stop":
                     recording = False
                     if len(asr.audio) > 0 or asr.committed:
-                        text, lang, translation = await run(True)
-                        await ws.send_json({"type": "final", "transcript": text,
-                                            "lang": lang, "translation": translation})
+                        await tick(True)
                     else:
                         await ws.send_json({"type": "final", "transcript": "",
                                             "lang": None, "translation": ""})
@@ -811,11 +781,7 @@ async def asr_ws(ws: WebSocket):
                 pending += len(msg["bytes"])
                 if pending >= RETRANSCRIBE_BYTES:
                     pending = 0
-                    text, lang, translation = await run(False)
-                    out = {"type": "partial", "transcript": text, "lang": lang}
-                    if translation is not None:   # None → keep last shown output
-                        out["translation"] = translation
-                    await ws.send_json(out)
+                    await tick(False)
 
     except WebSocketDisconnect:
         pass
@@ -825,6 +791,22 @@ async def asr_ws(ws: WebSocket):
         try:
             await ws.send_json({"type": "error", "msg": f"{type(exc).__name__}: {exc}"})
         except Exception:
+            pass
+
+
+def _warmup():
+    """Run one tiny MT + ASR pass at startup so the *first* live utterance isn't
+    slowed by one-off CUDA kernel autotuning (the cold MT decode costs ~1 s extra).
+    Best-effort; only warms what's already resident on the GPU."""
+    if MODEL is not None:                  # local mode: warm the decode path
+        try:
+            _offline_translate("hello", "Telugu")
+        except Exception:  # noqa: BLE001
+            pass
+    if WHISPER is not None:                 # warm the ASR forward pass
+        try:
+            WHISPER.transcribe(np.zeros(SR, dtype=np.float32), language="en")
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -943,6 +925,7 @@ def main():
             print(f"[server] WARNING: ASR unavailable ({type(exc).__name__}: {exc}).")
             print("[server] Install it with: pip install faster-whisper")
 
+    _warmup()                              # first utterance is then full-speed
     print(f"[server] Open http://localhost:{args.port} in your browser")
 
     import uvicorn

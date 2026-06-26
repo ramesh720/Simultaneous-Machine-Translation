@@ -5,7 +5,7 @@
 // Translation is served by a remote LLM when available, else the local model.
 // A small mascot reacts to state; a Clear button kills any running process.
 
-const state = { srcLang: 'te', tgtLang: 'en', k: 3, languages: [], examples: {}, backend: 'local' };
+const state = { srcLang: 'en', tgtLang: 'te', k: 3, languages: [], examples: {}, backend: 'local' };
 const DEFAULT_LANGS = [
     { code: 'te', name: 'Telugu', script: 'తెలుగు' },
     { code: 'hi', name: 'Hindi', script: 'हिन्दी' },
@@ -257,12 +257,13 @@ async function doStep(words, finalizeFlag) {
 // =============================================================================
 // Speech: mic → 16 kHz PCM over WebSocket → server ASR → live translation.
 // The transcript fills the same source field; the translation streams as usual.
-// Auto-stops after 4 s of silence so it never waits forever.
+// Auto-stops after a short silence (treated as "sentence finished") so the full
+// translation is flushed without waiting forever.
 // =============================================================================
 const ICON_MIC = '<span class="material-symbols-outlined">mic</span>';
 const ICON_STOP = '<span class="material-symbols-outlined">stop</span>';
 
-const SILENCE_MS = 4000;     // auto-stop after this much continuous silence
+const SILENCE_MS = 2500;     // this much continuous silence = "sentence finished"
 const VOICE_RMS = 0.012;     // frame RMS above this counts as speech
 
 let mic = {
@@ -336,7 +337,7 @@ function onAudioFrame(e) {
     if (level > VOICE_RMS) mic.lastVoice = performance.now();
 }
 
-// Poll for 4 s of continuous silence → auto-stop (finalize the utterance).
+// Poll for a short continuous silence → auto-stop (finalize the utterance).
 function armSilenceWatch() {
     clearTimeout(mic.silenceTimer);
     const tick = () => {
@@ -359,7 +360,10 @@ function stopMic() {
     setReadout('Finishing…');
     setStatus(`${state.backend} · wait-${state.k}`, false);
     setMascot('thinking');
-    setTimeout(() => { if (mic.ws) { try { mic.ws.close(); } catch (_) {} mic.ws = null; } }, 5000);
+    // The socket is normally closed in onAsrMessage when the final (complete)
+    // translation arrives. This is only a safety net if that never comes — keep it
+    // long enough that a slow full-sentence decode is never cut off mid-way.
+    setTimeout(() => { if (mic.ws) { try { mic.ws.close(); } catch (_) {} mic.ws = null; } }, 30000);
 }
 
 function onAsrMessage(ev) {
@@ -368,14 +372,14 @@ function onAsrMessage(ev) {
 
     if (d.type === 'partial' || d.type === 'final') {
         if (d.transcript) $('source-input').value = d.transcript;
-        // Partials may omit `translation` (READ phase / no new stable word) —
-        // keep whatever is already shown rather than blanking it.
+        // Transcript-only and translation-only partials interleave (the server
+        // pushes the transcript first, then the translation): only touch the
+        // field that's present so neither clobbers the other. A missing/null
+        // `translation` (READ phase / no new stable word) keeps what's shown.
         if (d.translation !== undefined && d.translation !== null) setOutput(d.translation, d.type === 'partial');
-        if (d.lang) {
-            const l = state.languages.find((x) => x.code === d.lang);
-            if (l) { state.srcLang = l.code; $('src-lang').value = l.code; $('src-label').textContent = l.name; }
-            setReadout(`wait-${state.k} · ${langName(d.lang)} → ${langName(state.tgtLang)}`);
-        }
+        // Source language is pinned by the user's selection — never auto-switched
+        // from ASR. Just reflect the active direction in the readout.
+        setReadout(`wait-${state.k} · ${langName(state.srcLang)} → ${langName(state.tgtLang)}`);
         if (d.type === 'partial') setMascot('listening');
         if (d.type === 'final') {
             setOutput(d.translation, false);
